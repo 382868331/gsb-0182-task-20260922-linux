@@ -6,7 +6,9 @@
 1. 正常构造与索引（含 n=1000 接口边界、非成员、哈希碰撞非成员）；
 2. seed 重试：真实不可剥离集合 {a,b,i} 在 seed=0 失败、seed=2 成功；
 3. 重试上限被实际触发：把预算压为 1，公开 build() 返回 construction_failed；
-4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
+4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）；
+5. 增删差量与墓碑：删后重加、未知键、显式合并生成新快照、
+   合并前后一致且旧快照仍可查询。
 """
 
 from __future__ import annotations
@@ -98,6 +100,42 @@ def main() -> None:
     show_failure("lookup 键类型为 int", lambda: mphf.lookup(mphf.build([b"a"]), 123))
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
+
+    # ---------- 5. 增删差量、墓碑与显式合并 --------------------------------
+    hr("5. 不可变快照 + 增删差量（墓碑）与显式合并")
+    snap = mphf.build([b"alpha", b"beta", b"gamma", b"delta"])
+    idx = mphf.MutableIndex(snap)
+    print(f"基层快照 size={snap.size}；索引 size={idx.size}, pending={idx.pending}")
+
+    idx.delete(b"beta")                      # 基层成员 → 墓碑
+    s1 = idx.insert(b"epsilon")              # 差量新增
+    s2 = idx.insert(b"zeta")
+    print(f"delete(b'beta') 后 lookup -> {idx.lookup(b'beta')}（墓碑判非成员）")
+    print(f"insert(b'epsilon') -> 序号 {s1}; insert(b'zeta') -> 序号 {s2}"
+          f"（从 n={snap.size} 起单调分配）")
+    r = idx.insert(b"beta")                  # 删后重加：撤销墓碑
+    print(f"删后重加 insert(b'beta') -> 序号 {r}（恢复基层原序号）")
+    print(f"未知键 lookup(b'omega') -> {idx.lookup(b'omega')}")
+    print(f"当前 size={idx.size}, pending={idx.pending}")
+    # 旧快照不受差量影响，仍可查询
+    print(f"旧快照 lookup(b'beta') -> {mphf.lookup(snap, b'beta')}（基层原样）")
+
+    merged = idx.merge()                     # 显式合并 → 新快照
+    print(f"merge() -> 新快照 size={merged.size}, seed={merged.seed}, "
+          f"keys={[k.decode() for k in merged.keys]}")
+    for q in (b"alpha", b"beta", b"epsilon", b"zeta", b"omega"):
+        print(f"  合并后 lookup({q!r}) -> {mphf.lookup(merged, q)}")
+    print(f"合并后旧索引 lookup(b'epsilon') -> {idx.lookup(b'epsilon')}"
+          "（旧索引/旧快照仍可查询）")
+
+    show_failure("重复插入 insert(b'alpha')", lambda: idx.insert(b"alpha"))
+    show_failure("删除未知键 delete(b'omega')", lambda: idx.delete(b"omega"))
+    show_failure("重复删除 delete 后墓碑再删",
+                 lambda: (idx.delete(b"gamma"), idx.delete(b"gamma")))
+    show_failure("插入非 ASCII 键", lambda: idx.insert(b"bad\xff"))
+    show_failure("插入 bool 键", lambda: idx.insert(True))
+    show_failure("在失败哨兵上建索引",
+                 lambda: mphf.MutableIndex(mphf.CONSTRUCTION_FAILED))
 
     print("\n演示完成：以上均为当场真实计算。")
 

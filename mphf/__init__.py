@@ -4,7 +4,10 @@
 
 * ``build(keys)`` 在至多 1000 条 ASCII 字节串上构造表；
 * ``lookup(table, key)`` 返回键在构造输入中的序号（0..n-1），
-  非成员返回 ``NOT_FOUND``。
+  非成员返回 ``NOT_FOUND``；
+* ``MutableIndex(table)`` 在不可变快照上叠加增删差量与墓碑，
+  查询先差量后基层；``merge()`` 显式合并生成新快照，
+  旧快照与新快照各自独立、均可继续查询。
 
 哈希定义（公开契约）：对 4 字节大端 seed、单字节域标签 ``t in {0,1,2}``：
 
@@ -34,6 +37,7 @@ __all__ = [
     "NOT_FOUND",
     "CONSTRUCTION_FAILED",
     "MPHFTable",
+    "MutableIndex",
     "DuplicateKeyError",
     "build",
     "lookup",
@@ -54,12 +58,15 @@ NOT_FOUND: Final = -1
 
 
 class DuplicateKeyError(ValueError):
-    """构造输入中出现重复键。"""
+    """键已存在：构造输入中重复，或对 MutableIndex 重复插入。"""
 
-    def __init__(self, key: bytes, index: int):
-        super().__init__(
-            f"duplicate key at index {index}: {key!r} (keys must be unique)"
-        )
+    def __init__(self, key: bytes, index: int | None = None):
+        if index is None:
+            super().__init__(f"duplicate key: {key!r} (key already present)")
+        else:
+            super().__init__(
+                f"duplicate key at index {index}: {key!r} (keys must be unique)"
+            )
         self.key = key
         self.index = index
 
@@ -382,3 +389,165 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+# ------------------------------------------------------------------ 差量索引
+
+#: 差量字典中“无条目”的私有哨兵（None 已用作墓碑标记）。
+_MISSING: Final = object()
+
+
+class MutableIndex:
+    """在不可变 :class:`MPHFTable` 快照上叠加增删差量（含墓碑）的索引。
+
+    查询顺序为**先差量、后基层**：差量中的新增键直接返回其分配序号，
+    墓碑键直接判非成员；差量未触及的键回落到基层快照，命中仍以槽位
+    保存的完整键逐字节比较为准（与 :func:`lookup` 同一终检）。
+
+    序号约定：
+
+    * 基层成员的序号即快照中的构造序号 ``0..n-1``；
+    * 新增键的序号从 ``快照.size`` 起单调分配，删除**不回收**序号，
+      因此差量未合并前序号可能有空洞；
+    * 删除基层成员留下墓碑；对墓碑键重新 :meth:`insert` 撤销墓碑，
+      该键恢复其基层原序号；
+    * :meth:`merge` 把当前存活键集重建为新的紧凑快照，新快照内序号
+      重新从 0 连续编号——**合并前后同一键的序号可能不同**。
+
+    合并是纯函数：本索引、其基层快照在合并后均保持原样、照常可查。
+    本类不是线程安全的；如需并发/持久化请在调用方自行协调。
+    """
+
+    __slots__ = ("_base", "_delta", "_next_slot")
+
+    def __init__(self, snapshot: MPHFTable):
+        if snapshot is CONSTRUCTION_FAILED:
+            raise ValueError(
+                "cannot build a MutableIndex on CONSTRUCTION_FAILED"
+            )
+        if not isinstance(snapshot, MPHFTable):
+            raise TypeError(
+                "snapshot must be an MPHFTable produced by build(), "
+                f"got {type(snapshot).__name__}"
+            )
+        self._base = snapshot
+        # 差量：键 -> 分配序号（int）；键 -> None 表示墓碑（已删除）。
+        # dict 保持插入序，merge 时新增键按插入顺序进入新快照。
+        self._delta: dict[bytes, int | None] = {}
+        self._next_slot = snapshot.size
+
+    # ---------------------------------------------------------- 只读属性
+
+    @property
+    def snapshot(self) -> MPHFTable:
+        """本索引叠加其上的不可变基层快照。"""
+        return self._base
+
+    @property
+    def size(self) -> int:
+        """当前存活键数量（基层未删 + 差量新增）。"""
+        tombstones = sum(1 for v in self._delta.values() if v is None)
+        added = len(self._delta) - tombstones
+        return self._base.size - tombstones + added
+
+    @property
+    def pending(self) -> int:
+        """尚未合并的差量条目数（新增与墓碑合计）。"""
+        return len(self._delta)
+
+    def __len__(self) -> int:
+        return self.size
+
+    # -------------------------------------------------------------- 查询
+
+    def lookup(self, key) -> int:
+        """查询键的当前序号；非成员返回 :data:`NOT_FOUND`。
+
+        先查差量（新增命中 / 墓碑判非成员），再回落基层快照。
+        非 ASCII 字节串按必为非成员处理；键类型错误抛 ``TypeError``。
+        """
+        if isinstance(key, bool) or not isinstance(
+            key, (bytes, bytearray, memoryview)
+        ):
+            raise TypeError(
+                "key must be bytes-like (bytes/bytearray/memoryview), "
+                f"got {type(key).__name__}"
+            )
+        raw = bytes(key)
+        entry = self._delta.get(raw, _MISSING)
+        if entry is not _MISSING:
+            return NOT_FOUND if entry is None else entry
+        return lookup(self._base, raw)
+
+    def get(self, key, default=None):
+        """非成员返回 ``default`` 的便捷方法。"""
+        i = self.lookup(key)
+        return i if i != NOT_FOUND else default
+
+    # -------------------------------------------------------------- 变更
+
+    def insert(self, key) -> int:
+        """插入新键，返回分配给它的序号。
+
+        若该键是基层成员的墓碑（先删后加），撤销墓碑并恢复其基层原
+        序号。校验全部通过后才修改差量，失败不留部分变更。
+
+        Raises:
+            TypeError:  键不是 bytes-like（``bool`` 同样拒绝）。
+            ValueError: 键含非 ASCII 字节，或存活键数已达
+                :data:`MAX_KEYS` 上限。
+            DuplicateKeyError: 键当前已是成员（基层或差量新增）。
+        """
+        raw = _as_ascii_key(key, where="insert(key)")
+        entry = self._delta.get(raw, _MISSING)
+        if entry is not _MISSING:
+            if entry is None:
+                # 删后重加：撤销墓碑，恢复基层原序号。
+                del self._delta[raw]
+                return lookup(self._base, raw)
+            raise DuplicateKeyError(raw)
+        if lookup(self._base, raw) != NOT_FOUND:
+            raise DuplicateKeyError(raw)
+        if self.size >= MAX_KEYS:
+            raise ValueError(
+                f"index full: live keys already at limit {MAX_KEYS}"
+            )
+        slot = self._next_slot
+        self._next_slot += 1
+        self._delta[raw] = slot
+        return slot
+
+    def delete(self, key) -> None:
+        """删除成员键；基层成员留下墓碑，差量新增直接抹除。
+
+        Raises:
+            TypeError:  键不是 bytes-like（``bool`` 同样拒绝）。
+            ValueError: 键含非 ASCII 字节。
+            KeyError:   键不是当前成员（含重复删除同一墓碑）。
+        """
+        raw = _as_ascii_key(key, where="delete(key)")
+        entry = self._delta.get(raw, _MISSING)
+        if entry is not _MISSING:
+            if entry is None:
+                raise KeyError(f"delete: key already deleted: {raw!r}")
+            del self._delta[raw]
+            return
+        if lookup(self._base, raw) == NOT_FOUND:
+            raise KeyError(f"delete: key not present: {raw!r}")
+        self._delta[raw] = None
+
+    # -------------------------------------------------------------- 合并
+
+    def merge(self) -> "MPHFTable | ConstructionFailure":
+        """把当前存活键集显式合并为新的不可变快照。
+
+        新快照的键顺序确定：先是基层中未被删除的键（保持基层槽位
+        顺序），再是差量新增键（保持插入顺序）；随后用与 :func:`build`
+        完全相同的构造流程重建，因此结果确定性可复现。存活键数为零时
+        得到空表；构造预算耗尽时返回 :data:`CONSTRUCTION_FAILED`。
+
+        本索引与旧快照不被修改，合并后仍可照常查询。
+        """
+        live = [k for k in self._base.keys if self._delta.get(k, 0) is not None]
+        live.extend(k for k, v in self._delta.items() if v is not None)
+        return build(live)
