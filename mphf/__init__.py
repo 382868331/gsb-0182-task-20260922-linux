@@ -1,10 +1,13 @@
 """压缩字典的最小访问完美哈希（Minimal Perfect Hash Function）。
 
-确定性三哈希超图剥离方案：
+两层结构：
 
-* ``build(keys)`` 在至多 1000 条 ASCII 字节串上构造表；
-* ``lookup(table, key)`` 返回键在构造输入中的序号（0..n-1），
-  非成员返回 ``NOT_FOUND``。
+* **不可变快照**：``build(keys)`` 在至多 1000 条 ASCII 字节串上构造
+  :class:`MPHFTable`；``lookup(table, key)`` 返回键在构造输入中的序号
+  （0..n-1），非成员返回 ``NOT_FOUND``。
+* **增删差量层**：:class:`MPHFView` 在不修改快照的前提下记录新增键与
+  墓碑；查询“先差量、后基层”；``merge(view)`` 显式生成新快照，旧快照
+  仍可独立查询。
 
 哈希定义（公开契约）：对 4 字节大端 seed、单字节域标签 ``t in {0,1,2}``：
 
@@ -15,6 +18,7 @@
 
 命中判定：哈希只负责把键映射到槽位 ``slot = (g[h0]+g[h1]+g[h2]) mod n``；
 是否命中以槽位中保存的**完整键**逐字节比较为准，绝不以“哈希值存在”判定。
+差量层同理：新增表是完整键到记录的映射，墓碑是完整键的集合。
 
 仅使用 Python 3.14 标准库。
 """
@@ -34,9 +38,15 @@ __all__ = [
     "NOT_FOUND",
     "CONSTRUCTION_FAILED",
     "MPHFTable",
+    "MPHFView",
     "DuplicateKeyError",
+    "DuplicateViewKeyError",
+    "UnknownKeyError",
+    "MergeError",
     "build",
     "lookup",
+    "open_view",
+    "merge",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -62,6 +72,29 @@ class DuplicateKeyError(ValueError):
         )
         self.key = key
         self.index = index
+
+
+class DuplicateViewKeyError(ValueError):
+    """向差量层新增一个当前逻辑集合中已存在的键。"""
+
+    def __init__(self, key: bytes):
+        super().__init__(f"key already present in view: {key!r}")
+        self.key = key
+
+
+class UnknownKeyError(KeyError):
+    """从差量层删除一个当前逻辑集合中不存在的键。
+
+    继承自 :class:`KeyError`；消息中给出完整键值。
+    """
+
+    def __str__(self) -> str:
+        # KeyError 默认 __str__ 会给消息再加引号；统一直接返回消息文本。
+        return self.args[0] if self.args else ""
+
+
+class MergeError(RuntimeError):
+    """显式合并未能产生新快照（当前集合触发了构造预算耗尽）。"""
 
 
 @dataclass(frozen=True)
@@ -110,6 +143,152 @@ class MPHFTable:
     def get(self, key: bytes, default=None):
         """非成员返回 ``default`` 的便捷方法。"""
         i = lookup(self, key)
+        return i if i != NOT_FOUND else default
+
+
+class MPHFView:
+    """叠加在不可变快照之上的增删差量层。
+
+    基层 :class:`MPHFTable` 永不被修改；本对象记录两类差量：
+
+    * ``added``：相对基层新增的键（有序，按插入先后）；
+    * ``tombstones``：相对基层删除的键（墓碑，存完整键）。
+
+    查询顺序固定为**先差量、后基层**：
+
+    1. 键在 ``added`` 中 → 命中（返回其差量序号 ``base.size + 位置``）；
+    2. 键在 ``tombstones`` 中 → 已删除，:data:`NOT_FOUND`；
+    3. 否则查基层快照，命中须通过槽位内**完整原键**逐字节验证。
+
+    “删后重加”是干净状态：重新插入已删除的基层键时，墓碑被移除，键回到
+    基层（重新删除可再次产生墓碑）。
+
+    差量序号仅用于区分命中位置，``merge`` 后新快照会按当前逻辑集合重新
+    分配紧凑序号 ``0..n'-1``，不应跨快照比较序号。
+
+    属性:
+        base:      基层不可变快照（:class:`MPHFTable`）；
+        size:      当前逻辑键数（基层存活数 + 新增数）；
+        added:     新增键的元组（按插入顺序）；
+        tombstones: 墓碑键的元组（顺序确定，按加入先后）。
+    """
+
+    def __init__(self, table: "MPHFTable"):
+        if table is CONSTRUCTION_FAILED:
+            raise ValueError(
+                "cannot open a view on CONSTRUCTION_FAILED: build exhausted its seed budget"
+            )
+        if not isinstance(table, MPHFTable):
+            raise TypeError(
+                f"table must be an MPHFTable produced by build(), got {type(table).__name__}"
+            )
+        # dict 在 Python 3.7+ 保持插入顺序且去重；值仅为占位。
+        self._added: dict[bytes, None] = {}
+        self._tombstones: set[bytes] = set()
+        # 墓碑的稳定展示顺序（集合本身无序）。
+        self._tombstone_order: list[bytes] = []
+        self.base = table
+
+    # ------------------------------------------------------------ 状态读取
+
+    @property
+    def size(self) -> int:
+        """当前逻辑集合的键数。"""
+        return self.base.size - len(self._tombstones) + len(self._added)
+
+    @property
+    def added(self) -> tuple[bytes, ...]:
+        return tuple(self._added)
+
+    @property
+    def tombstones(self) -> tuple[bytes, ...]:
+        return tuple(self._tombstone_order)
+
+    def keys(self) -> list[bytes]:
+        """当前逻辑集合的全部键：基层存活键（原构造顺序）后接新增键。"""
+        result = [k for k in self.base.keys if k not in self._tombstones]
+        result.extend(self._added)
+        return result
+
+    def __contains__(self, key) -> bool:
+        return self.lookup(key) != NOT_FOUND
+
+    def __len__(self) -> int:
+        return self.size
+
+    # ------------------------------------------------------------ 变更操作
+
+    def add(self, key) -> int:
+        """新增一个键；键已存在（基层存活或差量中）时抛错，状态不变。
+
+        Returns:
+            该键在当前视图中的序号（基层成员为原构造序号；新增键为
+            ``base.size + 新增位置``）。
+
+        Raises:
+            TypeError: 键不是 bytes-like（``bool`` 同样拒绝）。
+            ValueError: 键含非 ASCII 字节，或逻辑集合将超过
+                :data:`MAX_KEYS`。
+            DuplicateViewKeyError: 键当前已存在。
+        """
+        b = _as_ascii_key(key, where="view.add")
+        if b in self._added:
+            raise DuplicateViewKeyError(b)
+        if b in self._tombstones:
+            # 删后重加：移除墓碑，键回到基层存活状态。逻辑键数会 +1，
+            # 因此同样必须先过上限检查（满表且有墓碑时可能超限）。
+            if self.size >= MAX_KEYS:
+                raise ValueError(
+                    f"too many keys: limit is {MAX_KEYS}, view already holds {self.size}"
+                )
+            self._tombstones.remove(b)
+            self._tombstone_order.remove(b)
+            return lookup(self.base, b)
+        base_slot = lookup(self.base, b)
+        if base_slot != NOT_FOUND:
+            raise DuplicateViewKeyError(b)
+        if self.size >= MAX_KEYS:
+            raise ValueError(
+                f"too many keys: limit is {MAX_KEYS}, view already holds {self.size}"
+            )
+        self._added[b] = None
+        return self.base.size + len(self._added) - 1
+
+    def remove(self, key) -> int:
+        """删除一个当前存在的键并写入墓碑；键不存在时抛错，状态不变。
+
+        Returns:
+            被删键在删除前的序号。
+
+        Raises:
+            TypeError:  键不是 bytes-like（``bool`` 同样拒绝）。
+            UnknownKeyError: 键不在当前逻辑集合中（本就被删或从未存在）。
+        """
+        b = _as_ascii_key(key, where="view.remove")
+        if b in self._added:
+            slot = self.base.size + list(self._added).index(b)
+            del self._added[b]
+            # 新增键从未进入基层：直接消失即可，不留墓碑
+            # （墓碑只用于遮盖基层键）。
+            return slot
+        if b in self._tombstones:
+            raise UnknownKeyError(f"unknown key for remove: {b!r} (already deleted)")
+        base_slot = lookup(self.base, b)
+        if base_slot == NOT_FOUND:
+            raise UnknownKeyError(f"unknown key for remove: {b!r}")
+        self._tombstones.add(b)
+        self._tombstone_order.append(b)
+        return base_slot
+
+    # ------------------------------------------------------------ 查询
+
+    def lookup(self, key) -> int:
+        """实例方法形式，语义同模块级 :func:`lookup`（支持视图）。"""
+        return lookup(self, key)
+
+    def get(self, key, default=None):
+        """非成员返回 ``default`` 的便捷方法。"""
+        i = self.lookup(key)
         return i if i != NOT_FOUND else default
 
 
@@ -334,36 +513,61 @@ def build(keys):
     return CONSTRUCTION_FAILED
 
 
-def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
+def _as_key_bytes(key, where: str = "lookup") -> bytes:
+    """查询键的类型校验与归一化；非 ASCII 不在此拦截（按非成员处理）。"""
+    if isinstance(key, bool) or not isinstance(key, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"{where}: key must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(key).__name__}"
+        )
+    return bytes(key)
+
+
+def lookup(table: "MPHFTable | MPHFView | ConstructionFailure", key) -> int:
     """查询键的序号。
 
     Args:
-        table: :func:`build` 返回的 :class:`MPHFTable`。
-        key:   bytes-like；非 ASCII 字节串按必为非成员处理。
+        table: :func:`build` 返回的 :class:`MPHFTable`，或
+            :func:`open_view` 得到的 :class:`MPHFView`。视图查询按
+            “先差量、后基层”解析：差量新增命中优先，墓碑遮盖基层，
+            最后才查基层快照。
+        key:   bytes-like；非 ASCII 字节串按必为非成员处理（返回
+            :data:`NOT_FOUND`，不抛错）。
 
     Returns:
-        成员返回其构造序号（0..n-1）；非成员返回 :data:`NOT_FOUND`（-1）。
-        命中以槽位完整键比较为准：即使非成员的哈希恰好落到某个槽位，
+        成员返回其序号；非成员返回 :data:`NOT_FOUND`（-1）。快照上为
+        构造序号 ``0..n-1``；视图中新增键的序号为
+        ``base.size + 新增位置``（合并后会重新编号，勿跨快照比较）。
+        命中始终以完整键比较为准：即使非成员的哈希恰好落到某个槽位，
         键不相等仍判定为非成员。
 
     Raises:
         TypeError:  表对象类型错误，或键不是 bytes-like（bool 同样拒绝）。
         ValueError: 对 :data:`CONSTRUCTION_FAILED` 哨兵查询。
     """
+    if isinstance(table, MPHFView):
+        raw = _as_key_bytes(key)
+        # 1) 差量新增表：完整键精确匹配。
+        if raw in table._added:
+            return table.base.size + list(table._added).index(raw)
+        # 2) 墓碑：已删除的基层键，即使基层哈希命中也不得复活。
+        if raw in table._tombstones:
+            return NOT_FOUND
+        # 3) 基层：完整键终检。
+        return _lookup_table(table.base, raw)
     if table is CONSTRUCTION_FAILED:
         raise ValueError(
             "cannot lookup in CONSTRUCTION_FAILED: build exhausted its seed budget"
         )
     if not isinstance(table, MPHFTable):
         raise TypeError(
-            f"table must be an MPHFTable produced by build(), got {type(table).__name__}"
+            f"table must be an MPHFTable or MPHFView, got {type(table).__name__}"
         )
-    if isinstance(key, bool) or not isinstance(key, (bytes, bytearray, memoryview)):
-        raise TypeError(
-            f"key must be bytes-like (bytes/bytearray/memoryview), got {type(key).__name__}"
-        )
-    raw = bytes(key)
+    return _lookup_table(table, _as_key_bytes(key))
 
+
+def _lookup_table(table: "MPHFTable", raw: bytes) -> int:
+    """在不可变快照上查询（``raw`` 已由调用方校验为 bytes）。"""
     n = table.size
     if n == 0:
         return NOT_FOUND
@@ -382,3 +586,44 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+def open_view(table: "MPHFTable") -> "MPHFView":
+    """在不可变快照上打开一个增删差量层。
+
+    快照本身永不被修改；多个视图互不影响。详见 :class:`MPHFView`。
+
+    Raises:
+        TypeError:  ``table`` 不是 :class:`MPHFTable`。
+        ValueError: ``table`` 是 :data:`CONSTRUCTION_FAILED` 哨兵。
+    """
+    return MPHFView(table)
+
+
+def merge(view: "MPHFView") -> "MPHFTable":
+    """显式合并：把视图的当前逻辑集合构造成**新**的不可变快照。
+
+    视图与其基层快照都不被修改：旧快照在合并后仍可独立查询，视图也可
+    继续累积差量。新快照的序号按当前集合（基层存活键原顺序后接新增键）
+    从 0 重新分配。
+
+    Returns:
+        新的 :class:`MPHFTable`。
+
+    Raises:
+        TypeError:  ``view`` 不是 :class:`MPHFView`。
+        MergeError: 当前集合在 256 个 seed 下均构造失败
+            （:func:`build` 返回 :data:`CONSTRUCTION_FAILED`）；此时视图与
+            旧快照保持原样，可继续使用。
+    """
+    if not isinstance(view, MPHFView):
+        raise TypeError(
+            f"merge expects an MPHFView, got {type(view).__name__}"
+        )
+    new_table = build(view.keys())
+    if new_table is CONSTRUCTION_FAILED:
+        raise MergeError(
+            "merge failed: rebuild exhausted the 256-seed budget for the "
+            f"current set of {view.size} keys; the view and old snapshot are unchanged"
+        )
+    return new_table

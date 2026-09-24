@@ -1,12 +1,14 @@
 """固定输入的离线演示：真实计算，无 sleep、无预录结果。
 
-运行：python demo.py（约 0.1 秒，远低于 8 秒预算）
+运行：python demo.py（约 0.1 秒，远低于 90 秒预算）
 
 展示：
 1. 正常构造与索引（含 n=1000 接口边界、非成员、哈希碰撞非成员）；
 2. seed 重试：真实不可剥离集合 {a,b,i} 在 seed=0 失败、seed=2 成功；
 3. 重试上限被实际触发：把预算压为 1，公开 build() 返回 construction_failed；
-4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
+4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）；
+5. 差量增删与墓碑：不改动快照的新增/删除、删后重加、未知键删除报错；
+6. 显式合并：生成新快照，旧快照仍可查询；合并失败时视图与旧快照不变。
 """
 
 from __future__ import annotations
@@ -98,6 +100,65 @@ def main() -> None:
     show_failure("lookup 键类型为 int", lambda: mphf.lookup(mphf.build([b"a"]), 123))
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
+
+    # ---------- 5. 差量增删与墓碑（基层快照不变） -------------------------
+    hr("5. 差量层：增/删/墓碑/删后重加（快照本身不被修改）")
+    base = mphf.build([b"alpha", b"beta", b"gamma"])
+    view = mphf.open_view(base)
+    print(f"  基层快照: {list(base.keys)}")
+
+    view.remove(b"beta")                       # 墓碑遮盖基层键
+    s_delta = view.add(b"delta")               # 差量新增
+    print(f"  remove(b'beta') 立墓碑；add(b'delta') -> 差量序号 {s_delta}")
+    print(f"  view.tombstones = {view.tombstones!r}, view.added = {view.added!r}")
+    for q in (b"alpha", b"beta", b"gamma", b"delta", b"zzz"):
+        print(f"  lookup(view, {q!r}) -> {mphf.lookup(view, q)}")
+    print(f"  当前逻辑集合: {view.keys()}，size = {view.size}")
+    print(f"  旧快照未被修改：lookup(base, b'beta') -> {mphf.lookup(base, b'beta')}")
+
+    # 删后重加：墓碑移除，键回到基层原序号
+    s_back = view.add(b"beta")
+    print(f"  删后重加 add(b'beta') -> {s_back}（回到基层序号，"
+          f"tombstones={view.tombstones!r}, added={view.added!r}）")
+
+    # 实际错误：重复添加、删除未知键、非法类型，且状态不留半更新
+    show_failure("重复添加已存在的 b'alpha'", lambda: view.add(b"alpha"))
+    show_failure("删除从未存在的 b'omega'", lambda: view.remove(b"omega"))
+    view.remove(b"beta")
+    show_failure("重复删除（墓碑已存在）", lambda: view.remove(b"beta"))
+    show_failure("add 非 ASCII", lambda: view.add(b"bad\xff"))
+    show_failure("remove 类型错误 int", lambda: view.remove(7))
+    print(f"  上述失败后状态不变：size = {view.size}，"
+          f"tombstones = {view.tombstones!r}")
+    view.add(b"beta")  # 恢复，供合并演示使用
+
+    # 边界：逻辑集合达到 1000 上限时拒绝新增
+    big = mphf.open_view(mphf.build([f"k{i:04d}".encode() for i in range(1000)]))
+    show_failure("满表（1000）再 add", lambda: big.add(b"one-too-many"))
+
+    # ---------- 6. 显式合并：生成新快照，旧快照仍可查 ---------------------
+    hr("6. 显式合并 merge(view)：新快照紧凑重排，旧快照仍可查询")
+    v6 = mphf.open_view(mphf.build([b"alpha", b"beta", b"gamma"]))
+    v6.remove(b"beta")
+    v6.add(b"delta")
+    t_merge = mphf.merge(v6)
+    print(f"  合并前视图逻辑集合: {v6.keys()}")
+    print(f"  新快照键序（0..n-1 重新编号）: {list(t_merge.keys)}")
+    for q in (b"alpha", b"beta", b"gamma", b"delta"):
+        print(f"    lookup(新快照, {q!r}) -> {mphf.lookup(t_merge, q)}")
+    print(f"  旧快照仍可查：lookup(v6.base, b'beta') -> {mphf.lookup(v6.base, b'beta')}")
+    print(f"  合并不改动视图：view.tombstones={v6.tombstones!r}, "
+          f"lookup(view, b'beta') -> {mphf.lookup(v6, b'beta')}")
+
+    # 合并失败的真实触发：预算压为 1，{a,b,i} seed=0 不可剥离
+    tricky_view = mphf.open_view(mphf.build([b"a", b"b", b"i"]))
+    with patch.object(mphf, "MAX_SEED_ATTEMPTS", 1):
+        try:
+            mphf.merge(tricky_view)
+        except mphf.MergeError as exc:
+            print(f"  预算=1 时合并抛 MergeError: {exc}")
+    print(f"  失败后视图与旧快照不变：size={tricky_view.size}，"
+          f"lookup(b'b') -> {mphf.lookup(tricky_view, b'b')}")
 
     print("\n演示完成：以上均为当场真实计算。")
 
