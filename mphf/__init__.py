@@ -4,7 +4,15 @@
 
 * ``build(keys)`` 在至多 1000 条 ASCII 字节串上构造表；
 * ``lookup(table, key)`` 返回键在构造输入中的序号（0..n-1），
-  非成员返回 ``NOT_FOUND``。
+  非成员返回 ``NOT_FOUND``；
+* ``build_kv(pairs)`` 在同一套完美哈希之上构造**自带值**的只读键值表
+  （值为 bytes，每项至多 :data:`MAX_VALUE_LEN` 字节），构建前按键字节序
+  排序，快照字节与传入顺序无关；
+* ``find_kv(snap, key)`` 经完美哈希定位并核对完整键，返回
+  ``(是否命中, 值)``——空值是有效命中，未命中另有布尔标志；
+* :class:`KvSnapshot` 提供确定性二进制快照的 ``to_bytes`` / ``save`` /
+  ``from_bytes`` / ``load``。载入只做字节解析与全面校验，**不**调用
+  build 重建，也**不**使用 pickle 等对象反序列化。
 
 哈希定义（公开契约）：对 4 字节大端 seed、单字节域标签 ``t in {0,1,2}``：
 
@@ -22,6 +30,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import struct
+from collections import abc as _abc
 from dataclasses import dataclass
 from math import gcd
 from typing import Final
@@ -37,6 +48,17 @@ __all__ = [
     "DuplicateKeyError",
     "build",
     "lookup",
+    # 键值只读快照
+    "MAX_VALUE_LEN",
+    "SNAPSHOT_MAGIC",
+    "SNAPSHOT_VERSION",
+    "SNAPSHOT_HEADER_SIZE",
+    "KvSnapshot",
+    "SnapshotFormatError",
+    "UnknownSnapshotVersionError",
+    "SnapshotChecksumError",
+    "build_kv",
+    "find_kv",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -382,3 +404,451 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+# ====================================================== 键值只读快照（v1）
+
+#: 单个值的字节长度上限（接口边界）。
+MAX_VALUE_LEN: Final = 4096
+
+#: 快照魔数（ASCII "MPHKVDB"）。
+SNAPSHOT_MAGIC: Final = b"MPHKVDB"
+
+#: 快照格式版本（当前唯一支持的版本）。
+SNAPSHOT_VERSION: Final = 1
+
+#: 快照头部长度：魔数 7 + 版本 2 + n/m/seed/attempts 各 4 + 体长度 8
+#: + SHA256 32 = 65 字节（7+2+16+8+32）。
+SNAPSHOT_HEADER_SIZE: Final = 65
+
+# 头部固定布局（大端）：magic(7s) version(H) n(I) m(I) seed(I) attempts(I)
+# body_len(Q) body_sha256(32s)。7+2+4*4+8+32 = 65。
+_HEADER = struct.Struct(">7sHIIIIQ32s")
+_U32 = struct.Struct(">I")
+
+
+class SnapshotFormatError(ValueError):
+    """快照字节不合法（截断、尾部多余、字段越界、结构校验失败等）。"""
+
+
+class UnknownSnapshotVersionError(SnapshotFormatError):
+    """快照版本号不在本实现支持范围内。"""
+
+    def __init__(self, version: int):
+        super().__init__(
+            f"unsupported snapshot version {version}; "
+            f"supported versions: {SNAPSHOT_VERSION}"
+        )
+        self.version = version
+
+
+class SnapshotChecksumError(SnapshotFormatError):
+    """快照体 SHA256 与头部记录不一致。"""
+
+
+def _as_bytes_value(raw: object, where: str) -> bytes:
+    """校验并归一化单个值：必须 bytes-like，长度至多 MAX_VALUE_LEN。"""
+    if isinstance(raw, bool) or not isinstance(
+        raw, (bytes, bytearray, memoryview)
+    ):
+        raise TypeError(
+            f"{where}: value must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(raw).__name__}"
+        )
+    b = bytes(raw)
+    if len(b) > MAX_VALUE_LEN:
+        raise ValueError(
+            f"{where}: value is {len(b)} bytes long, limit is {MAX_VALUE_LEN}"
+        )
+    return b
+
+
+@dataclass(frozen=True)
+class KvSnapshot:
+    """自带值的只读键值快照，全部状态在内存中，不持有任何文件句柄。
+
+    键按键字节序排序后交给 :func:`build`，槽位 ``i`` 同时存放
+    ``keys[i]`` 与 ``values[i]``（排序后第 i 个键及其值）。索引字段与
+    :class:`MPHFTable` 同义。
+
+    属性：
+        size:         键数量 n；
+        vertex_count: 超图顶点数 m = ceil(1.4 n)；
+        seed:         成功使用的 seed（0..255，空表为 0）；
+        attempts:     成功前尝试的 seed 个数（空表为 0）；
+        values_g:     每个顶点的赋值 g（0..n-1），长度 m；
+        keys:         槽位 i 的键，按键字节序升序，长度 n；
+        values:       槽位 i 的值（bytes，每项至多 4096 字节），长度 n。
+    """
+
+    size: int
+    vertex_count: int
+    seed: int
+    attempts: int
+    values_g: tuple[int, ...]
+    keys: tuple[bytes, ...]
+    values: tuple[bytes, ...]
+
+    # ------------------------------------------------------------ 查询
+
+    def find(self, key) -> tuple[bool, bytes | None]:
+        """实例方法形式，语义同模块级 :func:`find_kv`。"""
+        return find_kv(self, key)
+
+    def get(self, key, default=None):
+        """命中返回值（含空值），未命中返回 ``default``。"""
+        hit, value = find_kv(self, key)
+        return value if hit else default
+
+    def __contains__(self, key) -> bool:
+        return find_kv(self, key)[0]
+
+    def __len__(self) -> int:
+        return self.size
+
+    # ------------------------------------------------------------ 持久化
+
+    def to_bytes(self) -> bytes:
+        """序列化为确定性 v1 快照字节。
+
+        同一键值集合无论传入 :func:`build_kv` 时的顺序如何，输出字节
+        逐位相同（构建前按键字节序排序，序列化按槽位顺序）。
+        """
+        return _encode_snapshot(self)
+
+    def save(self, path) -> None:
+        """把快照原子写入 ``path``（``str``/``os.PathLike``）。"""
+        data = self.to_bytes()
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+
+    @classmethod
+    def from_bytes(cls, data) -> "KvSnapshot":
+        """从快照字节载入；只解析与校验，不 build、不做对象反序列化。"""
+        if isinstance(data, bool) or not isinstance(
+            data, (bytes, bytearray, memoryview)
+        ):
+            raise TypeError(
+                "snapshot data must be bytes-like "
+                f"(bytes/bytearray/memoryview), got {type(data).__name__}"
+            )
+        return _decode_snapshot(bytes(data))
+
+    @classmethod
+    def load(cls, path) -> "KvSnapshot":
+        """从文件载入；读完即关闭句柄，返回对象不依赖该文件。"""
+        with open(path, "rb") as f:
+            data = f.read()
+        return cls.from_bytes(data)
+
+
+# ----------------------------------------------------------- 快照编解码内部
+
+
+def _encode_snapshot(snap: "KvSnapshot") -> bytes:
+    g = b"".join(_U32.pack(x) for x in snap.values_g)
+    records = bytearray()
+    for key, value in zip(snap.keys, snap.values):
+        records += _U32.pack(len(key))
+        records += key
+        records += _U32.pack(len(value))
+        records += value
+    body = g + bytes(records)
+    digest = hashlib.sha256(body).digest()
+    header = _HEADER.pack(
+        SNAPSHOT_MAGIC,
+        SNAPSHOT_VERSION,
+        snap.size,
+        snap.vertex_count,
+        snap.seed,
+        snap.attempts,
+        len(body),
+        digest,
+    )
+    return header + body
+
+
+def _decode_snapshot(data: bytes) -> "KvSnapshot":
+    # 1) 长度：至少能放下定长头部。
+    if len(data) < SNAPSHOT_HEADER_SIZE:
+        raise SnapshotFormatError(
+            f"snapshot too short: {len(data)} bytes, "
+            f"need at least {SNAPSHOT_HEADER_SIZE}"
+        )
+    magic, version, n, m, seed, attempts, body_len, digest = _HEADER.unpack(
+        data[:SNAPSHOT_HEADER_SIZE]
+    )
+    # 2) 魔数与版本。
+    if magic != SNAPSHOT_MAGIC:
+        raise SnapshotFormatError(
+            f"bad magic: {magic!r} (expected {SNAPSHOT_MAGIC!r})"
+        )
+    if version != SNAPSHOT_VERSION:
+        raise UnknownSnapshotVersionError(version)
+
+    # 3) 长度闭合：体长度与文件实际长度必须精确一致（截断/多余都拒绝）。
+    if len(data) != SNAPSHOT_HEADER_SIZE + body_len:
+        raise SnapshotFormatError(
+            f"length mismatch: header declares body of {body_len} bytes, "
+            f"file has {len(data) - SNAPSHOT_HEADER_SIZE} "
+            "(truncated or trailing data)"
+        )
+    body = data[SNAPSHOT_HEADER_SIZE:]
+
+    # 3.5) 校验和先行：在按体内容做任何结构性解释之前，先确认体 SHA256
+    #      与头部一致。注意校验和正确不代表内部合法——上限、唯一性、键序、
+    #      槽位归属等结构校验在其后继续进行。
+    if hashlib.sha256(body).digest() != digest:
+        raise SnapshotChecksumError("body SHA256 does not match header checksum")
+
+    # 4) 上限与索引参数（纯整数比较，先于深层结构解析）。
+    if n > MAX_KEYS:
+        raise SnapshotFormatError(f"key count {n} exceeds limit {MAX_KEYS}")
+    if m != _vertex_count(n):
+        raise SnapshotFormatError(
+            f"vertex_count {m} inconsistent with key count {n}: "
+            f"expected {_vertex_count(n)}"
+        )
+    if n == 0:
+        if seed != 0 or attempts != 0:
+            raise SnapshotFormatError(
+                f"empty snapshot must carry seed=0 attempts=0, got "
+                f"seed={seed} attempts={attempts}"
+            )
+    else:
+        if not 0 <= seed < MAX_SEED_ATTEMPTS:
+            raise SnapshotFormatError(
+                f"seed {seed} out of range 0..{MAX_SEED_ATTEMPTS - 1}"
+            )
+        if attempts != seed + 1:
+            raise SnapshotFormatError(
+                f"attempts {attempts} inconsistent with seed {seed}: "
+                f"expected {seed + 1}"
+            )
+
+    g_len = m * 4
+    if body_len < g_len:
+        raise SnapshotFormatError(
+            f"body {body_len} bytes shorter than g array ({g_len} bytes)"
+        )
+    g = tuple(_U32.unpack(body[off : off + 4])[0] for off in range(0, g_len, 4))
+    if n > 0 and any(not 0 <= x < n for x in g):
+        raise SnapshotFormatError(f"g array contains a value outside 0..{n - 1}")
+
+    # 5) 逐条解析记录：长度、上限、ASCII 规则与闭合。
+    keys: list[bytes] = []
+    values: list[bytes] = []
+    pos = g_len
+
+    def need(inc: int, what: str) -> None:
+        if pos + inc > body_len:
+            raise SnapshotFormatError(
+                f"truncated record at offset {pos}: missing {what}"
+            )
+
+    while pos < body_len:
+        need(4, "key length")
+        klen = _U32.unpack(body[pos : pos + 4])[0]
+        pos += 4
+        need(klen, "key bytes")
+        key = body[pos : pos + klen]
+        pos += klen
+        if any(ch >= 0x80 for ch in key):
+            raise SnapshotFormatError(f"non-ASCII byte in stored key {bytes(key)!r}")
+        need(4, "value length")
+        vlen = _U32.unpack(body[pos : pos + 4])[0]
+        pos += 4
+        if vlen > MAX_VALUE_LEN:
+            raise SnapshotFormatError(
+                f"stored value length {vlen} exceeds limit {MAX_VALUE_LEN}"
+            )
+        need(vlen, "value bytes")
+        values.append(bytes(body[pos : pos + vlen]))
+        pos += vlen
+        keys.append(bytes(key))
+    if pos != body_len:  # pragma: no cover - 循环条件保证等长，留作防御
+        raise SnapshotFormatError(f"record section not aligned at offset {pos}")
+    if len(keys) != n:
+        raise SnapshotFormatError(
+            f"record count {len(keys)} does not match declared key count {n}"
+        )
+
+    # 6) 键唯一且严格按键字节序升序（相邻比较同时覆盖两者）。
+    for i in range(1, n):
+        if keys[i - 1] == keys[i]:
+            raise SnapshotFormatError(f"duplicate key in snapshot: {keys[i]!r}")
+        if keys[i - 1] > keys[i]:
+            raise SnapshotFormatError(
+                f"keys not in byte order at slot {i}: "
+                f"{keys[i - 1]!r} followed by {keys[i]!r}"
+            )
+
+    # 7) 索引结构：每个键必须确实经 g 映射到自己的槽位 i。
+    for i, key in enumerate(keys):
+        slot = (
+            g[_hash_vertex(seed, 0, key, m)]
+            + g[_hash_vertex(seed, 1, key, m)]
+            + g[_hash_vertex(seed, 2, key, m)]
+        ) % n
+        if slot != i:
+            raise SnapshotFormatError(
+                f"key {key!r} lives at slot {i} but the index maps it to "
+                f"slot {slot}; index structure invalid"
+            )
+
+    return KvSnapshot(
+        size=n,
+        vertex_count=m,
+        seed=seed,
+        attempts=attempts,
+        values_g=g,
+        keys=tuple(keys),
+        values=tuple(values),
+    )
+
+
+# --------------------------------------------------------------------- 公开
+
+
+def build_kv(pairs):
+    """构造自带值的只读键值快照。
+
+    Args:
+        pairs: ``(key, value)`` 对的可迭代对象（list、tuple、生成器、
+            ``dict.items`` 等），也可直接传入 ``dict``。键遵守与
+            :func:`build` 相同的 ASCII bytes 规则（至多 1000 个、不得
+            重复）；值必须是 bytes-like 且每项至多 :data:`MAX_VALUE_LEN`
+            （4096）字节，空值 ``b""`` 合法。构建前按键的**字节序**固定
+            排序，因此同一键值集合无论传入顺序如何，快照字节完全相同。
+
+    Returns:
+        成功返回 :class:`KvSnapshot`；256 个 seed 全部失败时返回哨兵
+        :data:`CONSTRUCTION_FAILED`（与 :func:`build` 相同的失败语义）。
+
+    Raises:
+        TypeError:  容器/键/值类型错误（``bool`` 同样拒绝）。
+        ValueError: 键含非 ASCII 字节、值超长、键数超过 1000。
+        DuplicateKeyError: 存在重复键，直接拒绝，不静默覆盖。
+    """
+    if isinstance(pairs, _abc.Mapping):
+        iterator = iter(pairs.items())
+    else:
+        if isinstance(pairs, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "pairs must be an iterable of (key, value) pairs, "
+                "not a single bytes-like object"
+            )
+        try:
+            iterator = iter(pairs)
+        except TypeError as exc:
+            raise TypeError(
+                "pairs must be an iterable of (key, value) pairs"
+            ) from exc
+
+    normalized: list[tuple[bytes, bytes]] = []
+    seen: set[bytes] = set()
+    for idx, pair in enumerate(iterator):
+        if idx >= MAX_KEYS:
+            raise ValueError(
+                f"too many keys: limit is {MAX_KEYS}, input has at least {idx + 1}"
+            )
+        try:
+            raw_key, raw_value = pair
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"pairs[{idx}]: each item must unpack to (key, value)"
+            ) from exc
+        key = _as_ascii_key(raw_key, where=f"pairs[{idx}] key")
+        if key in seen:
+            raise DuplicateKeyError(key, idx)
+        seen.add(key)
+        value = _as_bytes_value(raw_value, where=f"pairs[{idx}] value")
+        normalized.append((key, value))
+
+    normalized.sort(key=lambda kv: kv[0])
+    ordered_keys = tuple(k for k, _ in normalized)
+    ordered_values = tuple(v for _, v in normalized)
+    n = len(ordered_keys)
+
+    if n == 0:
+        return KvSnapshot(
+            size=0,
+            vertex_count=0,
+            seed=0,
+            attempts=0,
+            values_g=(),
+            keys=(),
+            values=(),
+        )
+
+    table = build(ordered_keys)
+    if table is CONSTRUCTION_FAILED:
+        return CONSTRUCTION_FAILED
+    return KvSnapshot(
+        size=table.size,
+        vertex_count=table.vertex_count,
+        seed=table.seed,
+        attempts=table.attempts,
+        values_g=table.values,
+        keys=ordered_keys,
+        values=ordered_values,
+    )
+
+
+def find_kv(snapshot, key) -> tuple[bool, bytes | None]:
+    """在只读快照中按键查询。
+
+    定位方式与 :func:`lookup` 完全一致：经现有完美哈希算出槽位，再与槽位
+    中保存的完整原键逐字节核对，不做整表字典查找。
+
+    Args:
+        snapshot: :func:`build_kv` 返回或从快照载入的 :class:`KvSnapshot`。
+        key:      bytes-like；非 ASCII 字节串按未命中处理。
+
+    Returns:
+        ``(True, value)`` 表示命中，``value`` 可能为空字节串；
+        ``(False, None)`` 表示未命中。命中与否另有独立布尔标志，调用方
+        无需（也不应）用“值是否为空”猜测命中。
+
+    Raises:
+        TypeError:  快照或键的类型错误。
+        ValueError: 对 :data:`CONSTRUCTION_FAILED` 哨兵查询。
+    """
+    if snapshot is CONSTRUCTION_FAILED:
+        raise ValueError(
+            "cannot find in CONSTRUCTION_FAILED: build exhausted its seed budget"
+        )
+    if not isinstance(snapshot, KvSnapshot):
+        raise TypeError(
+            "snapshot must be a KvSnapshot produced by build_kv() or "
+            f"KvSnapshot.load(), got {type(snapshot).__name__}"
+        )
+    if isinstance(key, bool) or not isinstance(key, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"key must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(key).__name__}"
+        )
+    raw = bytes(key)
+
+    n = snapshot.size
+    if n == 0:
+        return False, None
+    if any(ch >= 0x80 for ch in raw):
+        return False, None
+
+    m = snapshot.vertex_count
+    seed = snapshot.seed
+    g = snapshot.values_g
+    slot = (
+        g[_hash_vertex(seed, 0, raw, m)]
+        + g[_hash_vertex(seed, 1, raw, m)]
+        + g[_hash_vertex(seed, 2, raw, m)]
+    ) % n
+
+    # 完整键终检：哈希只负责定位，键不等就是未命中。
+    if snapshot.keys[slot] == raw:
+        return True, snapshot.values[slot]
+    return False, None
+
