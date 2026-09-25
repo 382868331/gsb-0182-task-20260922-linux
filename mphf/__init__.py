@@ -37,6 +37,19 @@ __all__ = [
     "DuplicateKeyError",
     "build",
     "lookup",
+    # 索引认证扩展（见 mphf/auth.py）
+    "PROOF_FORMAT_VERSION",
+    "EMPTY_ROOT",
+    "SIDE_LEFT",
+    "SIDE_RIGHT",
+    "SlotProof",
+    "SortedProof",
+    "AbsenceProof",
+    "Manifest",
+    "AuthenticatedIndex",
+    "build_authenticated",
+    "verify_membership",
+    "verify_absence",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -382,3 +395,21 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+# ------------------------------------------------------- 索引认证扩展（再导出）
+# 在核心定义之后导入，auth 模块反向引用本模块的公开名字。
+from .auth import (  # noqa: E402
+    PROOF_FORMAT_VERSION,
+    EMPTY_ROOT,
+    SIDE_LEFT,
+    SIDE_RIGHT,
+    SlotProof,
+    SortedProof,
+    AbsenceProof,
+    Manifest,
+    AuthenticatedIndex,
+    build_authenticated,
+    verify_membership,
+    verify_absence,
+)

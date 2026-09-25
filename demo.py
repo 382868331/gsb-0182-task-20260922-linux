@@ -1,12 +1,13 @@
 """固定输入的离线演示：真实计算，无 sleep、无预录结果。
 
-运行：python demo.py（约 0.1 秒，远低于 8 秒预算）
+运行：./.venv/bin/python demo.py（约 0.2 秒，远低于 90 秒预算）
 
 展示：
 1. 正常构造与索引（含 n=1000 接口边界、非成员、哈希碰撞非成员）；
 2. seed 重试：真实不可剥离集合 {a,b,i} 在 seed=0 失败、seed=2 成功；
 3. 重试上限被实际触发：把预算压为 1，公开 build() 返回 construction_failed；
-4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
+4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）；
+5. 索引认证：版本清单、成员证明与不存在证明的离线验证及篡改拒绝。
 """
 
 from __future__ import annotations
@@ -98,6 +99,46 @@ def main() -> None:
     show_failure("lookup 键类型为 int", lambda: mphf.lookup(mphf.build([b"a"]), 123))
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
+
+    # ---------- 5. 索引认证：成员证明与不存在证明（离线验证）--------------
+    hr("5. 索引认证：Merkle 成员/不存在证明")
+    auth = mphf.build_authenticated(table)
+    man = auth.manifest
+    print(f"  版本清单: version={man.version}, size={man.size}")
+    print(f"  槽位树根: {man.slot_root.hex()[:32]}...")
+    print(f"  键序树根: {man.sorted_root.hex()[:32]}...")
+    print(f"  清单承诺 digest: {man.digest().hex()[:32]}...")
+
+    member = b"doc-0500"
+    proof = auth.prove(member)
+    print(f"  prove({member!r}) -> 槽号 {proof.slot}，兄弟路径 {len(proof.path)} 步")
+    ok = mphf.verify_membership(man.slot_root, man.size, member, proof)
+    print(f"  离线验证成员证明: {ok}")
+    tampered = mphf.verify_membership(man.slot_root, man.size, b"doc-0501", proof)
+    print(f"  换键后验证（应 False）: {tampered}")
+    print(f"  非成员 prove(b'nope') -> {auth.prove(b'nope')}")
+
+    absent = b"doc-0500x"
+    ap = auth.prove_absence(absent)
+    print(f"  prove_absence({absent!r}) -> 前驱 {ap.predecessor.key!r}"
+          f"(秩 {ap.predecessor.rank}) / 后继 {ap.successor.key!r}"
+          f"(秩 {ap.successor.rank})")
+    ok2 = mphf.verify_absence(man.sorted_root, man.size, absent, ap)
+    print(f"  离线验证不存在证明: {ok2}")
+    # 非相邻秩伪造：两个真实存在键、秩不相邻，不能证明不存在
+    forged = mphf.AbsenceProof(
+        predecessor=mphf.SortedProof(ap.predecessor.rank - 1 if ap.predecessor.rank else 0,
+                                     ap.predecessor.key, ap.predecessor.slot,
+                                     ap.predecessor.path),
+        successor=ap.successor,
+    ) if ap.predecessor.rank else None
+    if forged is not None:
+        print(f"  非相邻秩伪造验证（应 False）: "
+              f"{mphf.verify_absence(man.sorted_root, man.size, absent, forged)}")
+
+    empty_man = mphf.build_authenticated(mphf.build([])).manifest
+    print(f"  空集合: 两树根均为 EMPTY_ROOT: "
+          f"{empty_man.slot_root == empty_man.sorted_root == mphf.EMPTY_ROOT}")
 
     print("\n演示完成：以上均为当场真实计算。")
 
