@@ -99,6 +99,41 @@ def main() -> None:
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
 
+    # ---------- 5. 索引认证：Merkle 成员/不存在证明（离线核验）-------------
+    hr("5. 索引认证：版本清单 + Merkle 证明")
+    auth = mphf.build_auth(table)
+    man = auth.manifest()
+    print(f"  版本清单：size={man.size}, version={man.version}")
+    print(f"  slot_root={man.slot_root.hex()[:32]}…  seq_root={man.seq_root.hex()[:32]}…")
+    print(f"  清单编码 {len(man.encode())} 字节（确定性，含版本号）")
+
+    # 成员证明：调用方只凭清单离线核验，不必信任查询端。
+    key = keys[7]
+    proof = mphf.prove(auth, key)
+    ok = mphf.verify_membership(man.slot_root, man.size, key, proof)
+    print(f"  prove({key!r}) -> 槽号 {proof.slot}，路径 {len(proof.path)} 层；"
+          f"离线核验 = {ok}")
+    assert ok
+
+    # 不存在证明：前驱/后继相邻秩。
+    q = b"doc-0007~"  # 落在 doc-0007 与 doc-0008 之间
+    ap = mphf.prove_absence(auth, q)
+    ok_abs = mphf.verify_absence(man.seq_root, man.size, q, ap)
+    print(f"  prove_absence({q!r}) -> 前驱 {ap.predecessor.key!r}(秩{ap.predecessor.rank})"
+          f" / 后继 {ap.successor.key!r}(秩{ap.successor.rank})；离线核验 = {ok_abs}")
+    assert ok_abs
+
+    # 篡改即拒绝：换槽号、截短路径、非相邻秩。
+    forged = mphf.MembershipProof(slot=(proof.slot + 1) % man.size, path=proof.path)
+    print(f"  篡改槽号 -> 核验 = "
+          f"{mphf.verify_membership(man.slot_root, man.size, key, forged)}")
+    truncated = mphf.MembershipProof(slot=proof.slot, path=proof.path[:-1])
+    print(f"  截短路径 -> 核验 = "
+          f"{mphf.verify_membership(man.slot_root, man.size, key, truncated)}")
+    gap = mphf.prove_absence(auth, b"doc-0003~")
+    far = mphf.AbsenceProof(predecessor=gap.predecessor, successor=ap.successor)
+    print(f"  非相邻前后驱 -> 核验 = {mphf.verify_absence(man.seq_root, man.size, q, far)}")
+
     print("\n演示完成：以上均为当场真实计算。")
 
 

@@ -16,6 +16,11 @@
 命中判定：哈希只负责把键映射到槽位 ``slot = (g[h0]+g[h1]+g[h2]) mod n``；
 是否命中以槽位中保存的**完整键**逐字节比较为准，绝不以“哈希值存在”判定。
 
+索引认证扩展（``mphf/auth.py``，此处统一再导出）：在只读键集合上构建
+槽位 Merkle 树与按键序排列的认证序列树，两树根与总键数组成版本清单
+``Manifest``；``prove``/``prove_absence`` 生成证明，
+``verify_membership``/``verify_absence`` 凭清单离线核验。
+
 仅使用 Python 3.14 标准库。
 """
 
@@ -37,6 +42,21 @@ __all__ = [
     "DuplicateKeyError",
     "build",
     "lookup",
+    # 索引认证扩展（见 mphf/auth.py）
+    "PROOF_VERSION",
+    "EMPTY_ROOT",
+    "Manifest",
+    "MembershipProof",
+    "NeighborProof",
+    "AbsenceProof",
+    "AuthIndex",
+    "build_auth",
+    "prove",
+    "prove_absence",
+    "verify_membership",
+    "verify_absence",
+    "decode_membership_proof",
+    "decode_absence_proof",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -382,3 +402,27 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+# --------------------------------------------------------------------- 认证扩展
+#
+# 索引认证（Merkle 成员/不存在证明、版本清单）实现在 mphf/auth.py，
+# 这里统一再导出，调用方只需 ``import mphf``。放在模块末尾是因为 auth
+# 依赖上面已定义的 MPHFTable / lookup / CONSTRUCTION_FAILED / NOT_FOUND。
+
+from .auth import (  # noqa: E402
+    EMPTY_ROOT,
+    PROOF_VERSION,
+    AbsenceProof,
+    AuthIndex,
+    Manifest,
+    MembershipProof,
+    NeighborProof,
+    build_auth,
+    decode_absence_proof,
+    decode_membership_proof,
+    prove,
+    prove_absence,
+    verify_absence,
+    verify_membership,
+)
