@@ -3,8 +3,10 @@
 确定性三哈希超图剥离方案：
 
 * ``build(keys)`` 在至多 1000 条 ASCII 字节串上构造表；
-* ``lookup(table, key)`` 返回键在构造输入中的序号（0..n-1），
-  非成员返回 ``NOT_FOUND``。
+ * ``lookup(table, key)`` 返回键在构造输入中的序号（0..n-1），
+   非成员返回 ``NOT_FOUND``。
+ * ``iter_prefix(table, prefix, limit=..., cursor=...)`` 按原始字节键的
+   字典序迭代指定前缀的全部键，支持稳定游标分页。
 
 哈希定义（公开契约）：对 4 字节大端 seed、单字节域标签 ``t in {0,1,2}``：
 
@@ -33,11 +35,14 @@ __all__ = [
     "MAX_SEED_ATTEMPTS",
     "NOT_FOUND",
     "CONSTRUCTION_FAILED",
-    "MPHFTable",
-    "DuplicateKeyError",
-    "build",
-    "lookup",
-]
+     "MPHFTable",
+     "PrefixPage",
+     "DuplicateKeyError",
+     "CursorError",
+     "build",
+     "lookup",
+     "iter_prefix",
+ ]
 
 #: 输入键数量上限（接口边界）。
 MAX_KEYS: Final = 1000
@@ -92,8 +97,16 @@ class MPHFTable:
         vertex_count: 超图顶点数 m = ceil(1.4 n)；
         seed:         成功使用的 seed（0..255）；
         values:       每个顶点的赋值 g（0..n-1），长度 m；
-        keys:         槽位内容，``keys[i]`` 即构造序号为 i 的键，长度 n；
-        attempts:     成功前尝试的 seed 个数（成功 seed 在内，>=1）。
+         keys:         槽位内容，``keys[i]`` 即构造序号为 i 的键，长度 n；
+         attempts:     成功前尝试的 seed 个数（成功 seed 在内，>=1）。
+         sorted_slots: 紧凑排序置换：按键字节字典序排列的槽号，
+             ``keys[sorted_slots[j]]`` 即字典序第 j 小的键。槽号本身
+             与排序位置无关，必须经此置换才能得到有序输出。
+         lcp:          相邻排序键的公共前缀长度，``lcp[j]`` 是字典序第 j
+             与第 j+1 个键的最长公共前缀字节数，长度 n-1（n<2 时为空）。
+         fingerprint:  字典指纹，SHA256(域标签 + 排序后各键的长度前缀
+             编码) 的 32 字节摘要；同一键集在任何进程中的构造结果一致，
+             游标凭它绑定字典。
     """
 
     size: int
@@ -102,6 +115,9 @@ class MPHFTable:
     values: tuple[int, ...]
     keys: tuple[bytes, ...]
     attempts: int
+    sorted_slots: tuple[int, ...]
+    lcp: tuple[int, ...]
+    fingerprint: bytes
 
     def lookup(self, key: bytes) -> int:
         """实例方法形式，语义同模块级 :func:`lookup`。"""
@@ -112,6 +128,15 @@ class MPHFTable:
         i = lookup(self, key)
         return i if i != NOT_FOUND else default
 
+    def iter_prefix(
+        self,
+        prefix: "bytes | None" = None,
+        limit: "int | None" = None,
+        cursor: "bytes | None" = None,
+    ) -> "PrefixPage":
+        """实例方法形式，语义同模块级 :func:`iter_prefix`。"""
+        return iter_prefix(self, prefix, limit=limit, cursor=cursor)
+
 
 # --------------------------------------------------------------------- 内部
 
@@ -119,6 +144,33 @@ class MPHFTable:
 def _vertex_count(n: int) -> int:
     """m = ceil(1.4 * n)，纯整数运算，无浮点误差口径问题。"""
     return (LOAD_FACTOR_NUM * n + LOAD_FACTOR_DEN - 1) // LOAD_FACTOR_DEN
+
+
+def _sorted_permutation(keys: tuple[bytes, ...]) -> tuple[int, ...]:
+    """紧凑排序置换：槽号按键字节字典序排列（与槽号顺序无关）。"""
+    return tuple(sorted(range(len(keys)), key=keys.__getitem__))
+
+
+def _lcp_lengths(sorted_keys: tuple[bytes, ...]) -> tuple[int, ...]:
+    """相邻排序键的最长公共前缀字节数，长度 n-1。"""
+    out: list[int] = []
+    for a, b in zip(sorted_keys, sorted_keys[1:]):
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        out.append(i)
+    return tuple(out)
+
+
+def _fingerprint(sorted_keys: tuple[bytes, ...]) -> bytes:
+    """字典指纹：仅由排序后的键内容决定，跨进程稳定。"""
+    h = hashlib.sha256(b"MPHF-PREFIX-V1")
+    h.update(len(sorted_keys).to_bytes(8, "big"))
+    for k in sorted_keys:
+        h.update(len(k).to_bytes(4, "big"))
+        h.update(k)
+    return h.digest()
 
 
 def _as_ascii_key(raw: object, where: str) -> bytes:
@@ -307,6 +359,11 @@ def build(keys):
     keys_tuple = tuple(normalized)
     n = len(keys_tuple)
 
+    sorted_slots = _sorted_permutation(keys_tuple)
+    sorted_keys = tuple(keys_tuple[s] for s in sorted_slots)
+    lcp = _lcp_lengths(sorted_keys)
+    fingerprint = _fingerprint(sorted_keys)
+
     if n == 0:
         # 空集合：空表。seed/顶点数等字段取确定性零值。
         return MPHFTable(
@@ -316,6 +373,9 @@ def build(keys):
             values=(),
             keys=(),
             attempts=0,
+            sorted_slots=(),
+            lcp=(),
+            fingerprint=fingerprint,
         )
 
     m = _vertex_count(n)
@@ -330,6 +390,9 @@ def build(keys):
                 values=tuple(values),
                 keys=keys_tuple,
                 attempts=seed + 1,
+                sorted_slots=sorted_slots,
+                lcp=lcp,
+                fingerprint=fingerprint,
             )
     return CONSTRUCTION_FAILED
 
@@ -382,3 +445,197 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+# --------------------------------------------------------------------- 前缀迭代
+
+#: 游标编码魔数（版本标签）。
+_CURSOR_MAGIC: Final = b"MPX1"
+#: 游标中携带的指纹字节数。
+_CURSOR_FP_LEN: Final = 8
+
+
+class CursorError(ValueError):
+    """游标无法解码、结构非法，或不属于当前字典。"""
+
+
+@dataclass(frozen=True)
+class PrefixPage:
+    """一次前缀迭代的结果页。
+
+    属性：
+        keys:        本页键，按原始字节字典序排列。
+        next_cursor: 继续位置的不透明稳定编码（bytes）；本页已是最后一页
+            时为 ``None``。游标绑定字典指纹与前缀，不依赖进程地址，
+            可跨进程、跨次运行使用。
+        accessed:    本次查询实际读取的键次数（二分定位 + 命中校验 +
+            逐条输出），用于证明只访问候选范围而非全表扫描。
+        prefix:      本页实际使用的前缀。
+    """
+
+    keys: tuple[bytes, ...]
+    next_cursor: "bytes | None"
+    accessed: int
+    prefix: bytes
+
+    @property
+    def done(self) -> bool:
+        """是否已迭代完该前缀的全部键。"""
+        return self.next_cursor is None
+
+
+def _encode_cursor(table: MPHFTable, prefix: bytes, position: int) -> bytes:
+    """稳定游标编码：魔数 + 指纹前缀 + 前缀字节 + 排序位置。
+
+    纯内容编码，不含任何进程地址或对象 id，跨进程可复现。
+    """
+    return (
+        _CURSOR_MAGIC
+        + table.fingerprint[:_CURSOR_FP_LEN]
+        + len(prefix).to_bytes(2, "big")
+        + prefix
+        + position.to_bytes(4, "big")
+    )
+
+
+def _decode_cursor(table: MPHFTable, cursor: object) -> tuple[bytes, int]:
+    """解码并校验游标，返回 ``(前缀, 排序位置)``。"""
+    if isinstance(cursor, bool) or not isinstance(cursor, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"cursor must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(cursor).__name__}"
+        )
+    raw = bytes(cursor)
+    header = len(_CURSOR_MAGIC) + _CURSOR_FP_LEN + 2
+    if len(raw) < header + 4 or not raw.startswith(_CURSOR_MAGIC):
+        raise CursorError(f"malformed cursor: {raw!r}")
+    fp = raw[len(_CURSOR_MAGIC):len(_CURSOR_MAGIC) + _CURSOR_FP_LEN]
+    if fp != table.fingerprint[:_CURSOR_FP_LEN]:
+        raise CursorError(
+            "cursor belongs to a different dictionary (fingerprint mismatch)"
+        )
+    plen = int.from_bytes(raw[len(_CURSOR_MAGIC) + _CURSOR_FP_LEN:header], "big")
+    if len(raw) != header + plen + 4:
+        raise CursorError(f"malformed cursor: bad length in {raw!r}")
+    prefix = raw[header:header + plen]
+    position = int.from_bytes(raw[header + plen:], "big")
+    if position > table.size:
+        raise CursorError(
+            f"malformed cursor: position {position} out of range (size={table.size})"
+        )
+    return prefix, position
+
+
+def _lower_bound(sorted_keys: tuple[bytes, ...], prefix: bytes, start: int) -> tuple[int, int]:
+    """在 ``sorted_keys[start:]`` 中二分定位 ``prefix`` 的下界。
+
+    返回 ``(位置, 读取键次数)``；只读取 O(log n) 个键，不扫描全表。
+    """
+    lo, hi = start, len(sorted_keys)
+    accessed = 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        accessed += 1
+        if sorted_keys[mid] < prefix:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo, accessed
+
+
+def iter_prefix(
+    table: "MPHFTable | ConstructionFailure",
+    prefix: "bytes | None" = None,
+    limit: "int | None" = None,
+    cursor: "bytes | None" = None,
+) -> PrefixPage:
+    """按字典序列出以 ``prefix`` 开头的键（分页）。
+
+    Args:
+        table:  :func:`build` 返回的 :class:`MPHFTable`。
+        prefix: 字节前缀，空前缀 ``b""`` 匹配全部键；含零字节按普通
+            字节处理；非 ASCII 前缀必无匹配（返回空页）。``None`` 表示
+            沿用游标中的前缀。
+        limit:  本页最多返回的键数；``None`` 表示不限（返回剩余全部）。
+        cursor: 上一页返回的 ``next_cursor``，从该位置继续；游标绑定
+            字典指纹，跨字典使用抛 :class:`CursorError`。
+
+    Returns:
+        :class:`PrefixPage`，键按原始字节字典序排列；``accessed`` 为
+        实际读取的键次数（候选范围定位 + 输出），与字典总量无关。
+
+    Raises:
+        TypeError:   表、前缀、limit 或游标类型错误（bool 同样拒绝）。
+        ValueError:  对 :data:`CONSTRUCTION_FAILED` 查询；``limit < 1``；
+            显式 ``prefix`` 与游标前缀不一致。
+        CursorError: 游标损坏、越界或属于其他字典（ValueError 子类）。
+    """
+    if table is CONSTRUCTION_FAILED:
+        raise ValueError(
+            "cannot iterate CONSTRUCTION_FAILED: build exhausted its seed budget"
+        )
+    if not isinstance(table, MPHFTable):
+        raise TypeError(
+            f"table must be an MPHFTable produced by build(), got {type(table).__name__}"
+        )
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int or None, got {type(limit).__name__}")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+    if prefix is not None:
+        if isinstance(prefix, bool) or not isinstance(prefix, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"prefix must be bytes-like (bytes/bytearray/memoryview), "
+                f"got {type(prefix).__name__}"
+            )
+        prefix = bytes(prefix)
+
+    if cursor is not None:
+        cur_prefix, start = _decode_cursor(table, cursor)
+        if prefix is not None and prefix != cur_prefix:
+            raise CursorError(
+                f"explicit prefix {prefix!r} does not match cursor prefix {cur_prefix!r}"
+            )
+        prefix = cur_prefix
+    else:
+        if prefix is None:
+            prefix = b""
+        start = 0
+
+    sorted_keys = tuple(table.keys[s] for s in table.sorted_slots)
+    n = len(sorted_keys)
+    accessed = 0
+
+    if n == 0 or start >= n or any(ch >= 0x80 for ch in prefix):
+        # 空表 / 游标已越界 / 非 ASCII 前缀：必无匹配，不读任何键。
+        return PrefixPage(keys=(), next_cursor=None, accessed=accessed, prefix=prefix)
+
+    plen = len(prefix)
+    if plen == 0:
+        first = start  # 空前缀匹配全部，无需定位。
+    else:
+        first, probe = _lower_bound(sorted_keys, prefix, start)
+        accessed += probe
+        if first < n:
+            accessed += 1
+            if not sorted_keys[first].startswith(prefix):
+                first = n  # 下界处的键不匹配，则无任何匹配。
+
+    out: list[bytes] = []
+    pos = first
+    while pos < n and (limit is None or len(out) < limit):
+        if plen and pos > first and table.lcp[pos - 1] < plen:
+            break  # 相邻公共前缀不足：候选范围结束，无需再读键。
+        accessed += 1
+        key = sorted_keys[pos]
+        if plen and pos == first and not key.startswith(prefix):
+            break
+        out.append(key)
+        pos += 1
+
+    more = pos < n
+    if more and plen and pos > first and table.lcp[pos - 1] < plen:
+        more = False  # 下一个键已确定不在候选范围内。
+    next_cursor = _encode_cursor(table, prefix, pos) if more else None
+    return PrefixPage(keys=tuple(out), next_cursor=next_cursor, accessed=accessed, prefix=prefix)

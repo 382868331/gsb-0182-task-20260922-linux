@@ -3,6 +3,8 @@
 为离线静态索引工程提供的可复用模块：给定至多 **1000 条互不重复的 ASCII
 字节串**，确定性构造一个**最小完美哈希函数**（Minimal Perfect Hash Function），
 把每个键映射到紧凑序号 `0..n-1`，并通过槽位中保存的完整键做非成员终检。
+在完美哈希之上还提供**前缀迭代**：按原始字节键的字典序分页列出任意
+前缀（含空前缀）匹配的全部键，查询只访问候选范围，不扫描全表。
 
 纯 Python 标准库实现，核心算法（三哈希超图剥离 + 顶点赋值）自行实现，
 未使用任何第三方同类库。
@@ -15,14 +17,26 @@
 - 完全离线：不访问网络、账号、数据库、中间件或云服务；示例数据由仓库内
   确定性代码生成。
 
+## 隔离 venv 准备
+
+```bash
+python3.14 -m venv .venv        # 隔离环境；不污染系统 Python
+. .venv/bin/activate
+python -V                        # 应为 Python 3.14.7
+# 无需 pip install：仅标准库
+```
+
 ## 准确命令
 
 ```bash
-# 必要测试（31 个用例）
+# 必要测试（50 个用例：31 个基线回归 + 19 个前缀迭代）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（当场真实计算，实测约 0.1 秒，远低于 8 秒预算；无 sleep、无预录）
 python demo.py
+
+# 前缀迭代演示（真实离线计算，远低于 90 秒；无账号/密钥/sleep/预录）
+python demo_iteration.py
 ```
 
 ## 公开接口
@@ -37,6 +51,34 @@ mphf.lookup(table, b"absent")    # -> mphf.NOT_FOUND (-1)
 table.lookup(b"alpha")           # 实例方法，等价
 table.get(b"absent", default=None)
 ```
+
+### 前缀迭代（新增）
+
+```python
+page = mphf.iter_prefix(table, b"ab", limit=100)
+page.keys          # 按原始字节字典序排列的本页键
+page.accessed      # 本次查询实际读取的键次数（候选范围定位 + 输出）
+page.next_cursor   # 继续位置的稳定 bytes 编码；None 表示已迭代完
+page.done          # 等价于 next_cursor is None
+
+# 跨页 / 跨进程继续：游标是纯内容编码，绑定字典指纹与前缀
+rest = mphf.iter_prefix(table, cursor=page.next_cursor)
+table.iter_prefix(b"ab")          # 实例方法，等价
+```
+
+- 结果按**原始字节键的字典序**返回；哈希槽号不等于排序位置，排序由
+  构造期保存的紧凑置换 `table.sorted_slots` 给出，与槽号顺序无关。
+- 空前缀 `b""` 匹配全部键；含零字节的键按普通字节参与排序与匹配。
+- 查询只访问候选范围：二分定位下界（O(log n) 次读键）后，借助构造期
+  保存的相邻键公共前缀数组 `table.lcp` 判定候选边界，只逐条读取实际
+  输出的键；`page.accessed` 给出本次读取键数，稀有前缀可直观看到
+  没有全表扫描。
+- `limit` 为本页最大键数（`None` 表示不限）；`cursor` 为上一页返回的
+  继续位置。游标编码为 `MPX1 ‖ 指纹8字节 ‖ 前缀长度 ‖ 前缀 ‖ 位置`，
+  不依赖进程地址，跨进程、跨次运行可用；它绑定 `table.fingerprint`
+  （排序键内容的 SHA256），**用在其他字典上抛 `mphf.CursorError`**。
+- 非 ASCII 前缀必无匹配（返回空页）；`limit < 1`、类型错误、损坏或
+  越界游标按“错误语义”一节抛错。
 
 ### `build(keys) -> MPHFTable | CONSTRUCTION_FAILED`
 
@@ -59,6 +101,9 @@ table.get(b"absent", default=None)
 | `values` | 每个顶点的赋值 `g`，`0..n-1` 的元组，长度 `m` |
 | `keys` | 槽位内容，`keys[i]` 即构造序号为 `i` 的原始键，长度 `n` |
 | `attempts` | 成功前尝试的 seed 个数（成功 seed 在内，≥1；空表为 0） |
+| `sorted_slots` | 紧凑排序置换：`keys[sorted_slots[j]]` 为字典序第 j 小的键 |
+| `lcp` | 相邻排序键的最长公共前缀字节数，长度 `n-1` |
+| `fingerprint` | 字典指纹（排序键内容的 SHA256，32 字节），游标凭它绑定字典 |
 
 ### `lookup(table, key) -> int`
 
@@ -112,6 +157,9 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 | 256 个 seed 全部失败 | **返回** `CONSTRUCTION_FAILED`（不抛异常） |
 | 对 `CONSTRUCTION_FAILED` 调用 `lookup` | `ValueError` |
 | 对非 `MPHFTable` 对象 `lookup` | `TypeError` |
+| 游标损坏 / 越界 / 属于其他字典 | `mphf.CursorError`（`ValueError` 子类） |
+| 显式 `prefix` 与游标前缀不一致 | `mphf.CursorError` |
+| `limit` 非整数或 `< 1` | `TypeError` / `ValueError`（`bool` 按 `TypeError` 拒绝） |
 
 **搜索预算耗尽 ≠ 证明无解**：`CONSTRUCTION_FAILED` 只表示“seed 0..255
 在本算法（固定 `m=1.4n`、三哈希、SHA256 线格式）下均未成功”，是**预算
@@ -151,11 +199,21 @@ build→lookup 的往返一致仅作为补充断言。覆盖：n=1..60 与多个
 拒绝、非 ASCII、重复键、类型/上限错误、确定性复现、128 个单字节 ASCII
 键全集。
 
+`tests/test_prefix.py` 以**排序后的原字典**（测试侧 `sorted()`）为参照，
+覆盖：排序置换与 LCP 数组逐位核对、空前缀全量、跨多页游标迭代
+（limit=1/7/100）、精确键同时也是别的键前缀、零字节键按普通字节排序、
+空结果、稀有前缀访问键数远小于全表（无全表扫描）、错误字典游标与
+损坏游标拒绝、游标跨 build 稳定复现、空表、参数校验，以及旧单键查询
+回归。
+
 ## 仓库布局
 
 ```
 mphf/__init__.py   # 核心库：build / lookup / MPHFTable / 错误与哨兵
-tests/test_mphf.py # 必要测试（独立参考期望值）
+                   #   及前缀迭代 iter_prefix / PrefixPage / CursorError
+tests/test_mphf.py # 基线必要测试（独立参考期望值）
+tests/test_prefix.py # 前缀迭代测试（sorted 原字典为参照）
 demo.py            # 固定输入演示：正常索引 + 重试 + 拒绝/异常边界
+demo_iteration.py  # 前缀迭代演示：分页、游标、访问键数、错误游标
 requirements.txt   # 无第三方依赖（说明性注释）
 ```
