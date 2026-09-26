@@ -18,12 +18,23 @@
 ## 准确命令
 
 ```bash
-# 必要测试（31 个用例）
+# 隔离 venv 准备（可选但推荐；仓库根目录的 .venv 即按此创建）
+python3.14 -m venv .venv
+source .venv/bin/activate   # 之后文中的 python 即 3.14.7
+
+# 必要测试（基线回归 + 前缀迭代，共 59 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（当场真实计算，实测约 0.1 秒，远低于 8 秒预算；无 sleep、无预录）
 python demo.py
+
+# 前缀迭代演示（同样当场真实计算，远低于 90 秒预算）
+python demo_iteration.py
 ```
+
+适用范围：离线静态只读字典（构造后不增删键），至多 1000 条互不重复的
+ASCII 字节串键；单键查询与前缀分页迭代均为进程内调用，不依赖网络、
+账号、密钥或外部服务。
 
 ## 公开接口
 
@@ -36,6 +47,17 @@ mphf.lookup(table, b"beta")      # -> 1
 mphf.lookup(table, b"absent")    # -> mphf.NOT_FOUND (-1)
 table.lookup(b"alpha")           # 实例方法，等价
 table.get(b"absent", default=None)
+```
+
+前缀迭代（在既有完美哈希之上的增量能力）：
+
+```python
+page = mphf.iter_prefix(table, b"doc-", limit=100)
+page.keys       # 按原始字节字典序排列的本页键
+page.total      # 该前缀的全部匹配数
+page.accessed   # 本次查询实际访问的键数（稀有前缀远小于 n）
+page.cursor     # 下一页游标；None 表示已取完
+page2 = mphf.iter_prefix(table, b"doc-", limit=100, cursor=page.cursor)
 ```
 
 ### `build(keys) -> MPHFTable | CONSTRUCTION_FAILED`
@@ -59,6 +81,10 @@ table.get(b"absent", default=None)
 | `values` | 每个顶点的赋值 `g`，`0..n-1` 的元组，长度 `m` |
 | `keys` | 槽位内容，`keys[i]` 即构造序号为 `i` 的原始键，长度 `n` |
 | `attempts` | 成功前尝试的 seed 个数（成功 seed 在内，≥1；空表为 0） |
+| `order` | 排序置换：`sorted_keys[i] is keys[order[i]]`，把构造序号排列成原始键字典序，长度 `n` |
+| `sorted_keys` | 按原始字节字典序排列的全部键（`order` 作用于 `keys` 的结果），长度 `n` |
+| `lcp` | 相邻键公共前缀长度；`lcp[0]=0`，`lcp[i]` 为排序后第 i-1 与第 i 个键的最长公共前缀长度，长度 `n` |
+| `fingerprint` | 对排序后键集合的确定性 SHA256 十六进制指纹；游标只接受同一指纹，与进程地址无关 |
 
 ### `lookup(table, key) -> int`
 
@@ -67,6 +93,28 @@ table.get(b"absent", default=None)
 - 命中判定以槽位保存的**完整键逐字节比较**为准：哈希只负责选出槽位，
   **绝不**以“哈希值存在/算出了某个槽位”判定命中。非成员即使哈希恰好
   落到已占用槽位也返回 `NOT_FOUND`。
+
+### `iter_prefix(table, prefix=b"", *, limit=None, cursor=None) -> PrefixPage`
+
+- 按**原始字节键的字典序**返回所有以 `prefix` 开头的成员；哈希槽号不是
+  排序位置，迭代完全不使用槽号顺序。
+- 空前缀 `b""` 匹配全部；零字节按普通字节参与比较；精确键同时也是别的键
+  的前缀时，它本身和其后继都会返回（如 `b"ab"`、`b"abc"` 同在
+  `prefix=b"ab"` 的结果中）；含非 ASCII 字节的前缀匹配为空（不报错，与
+  `lookup` 的非成员语义一致）。
+- `limit`：每页上限，正整数；`None` 表示一次取完；0/负数抛
+  `ValueError`，非 int（含 bool）抛 `TypeError`。
+- 区间定位只做两次二分：`lo=bisect_left(sk, prefix)`、
+  `hi=bisect_left(sk, prefix+b"\x80")`。由于全部键字节 < 0x80，
+  `[lo,hi)` 恰好是前缀候选区间——**不扫描全部键**，只读本页键。
+- `PrefixPage` 字段：`keys`（本页键元组）、`cursor`（下一页游标，
+  取完为 `None`）、`total`（该前缀总匹配数）、`accessed`（本次访问
+  的键数 = 两次二分比较次数 + 本页读取的键数，用来直观展示稀有前缀没有
+  全表扫描）。
+- 游标稳定编码：`mphfcur1.<64 位字典指纹>.<下一排序位置>`，纯文本、
+  不含进程地址；跨进程/重新构造的同内容字典（指纹相同）可续翻，绑定其他
+  字典时抛 `mphf.CursorError`（`ValueError` 子类），格式损坏同样抛
+  `CursorError`。游标不依赖基线已有序列化能力，是独立的小型文本协议。
 
 ### 哈希线格式（公开契约）
 
@@ -99,6 +147,11 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 6. **失败即无副作用**：构造是纯函数，校验先于构造；输入非法时在收集阶段
    抛错，不产生部分结果；seed 重试中的中间结构不逃逸；`MPHFTable`
    不可变（frozen）。
+7. **构造期排序索引**：build 成功时额外保存排序置换 `order`、排序键
+   `sorted_keys` 与相邻键公共前缀长度数组 `lcp`（LCP 信息随表保存，
+   供基于公共前缀的压缩/分析使用），以及对排序后键集合的 SHA256
+   `fingerprint`。前缀迭代在 `sorted_keys` 上两次二分定位候选区间，
+   只访问候选范围内的本页键，不复用、也不依赖哈希槽号顺序。
 
 ## 错误语义
 
@@ -108,6 +161,8 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 | 键含非 ASCII 字节 | `ValueError`，消息形如 `keys[i]: non-ASCII byte ...` |
 | 键数 > 1000 | `ValueError`（在第 1001 个元素处报错） |
 | 键/容器类型错误 | `TypeError`（含把 `str`、`int`、`None`、单 `bytes` 等传入） |
+| 游标绑定其他字典指纹 / 游标损坏 | `mphf.CursorError`（`ValueError` 子类） |
+| `limit` 为 0 或负数 | `ValueError`；非 int（含 bool）为 `TypeError` |
 | `bool` | `bool` 虽是 `int` 子类，在键位上一律按 `TypeError` 拒绝，不静默当作 `1/0` |
 | 256 个 seed 全部失败 | **返回** `CONSTRUCTION_FAILED`（不抛异常） |
 | 对 `CONSTRUCTION_FAILED` 调用 `lookup` | `ValueError` |
@@ -151,11 +206,19 @@ build→lookup 的往返一致仅作为补充断言。覆盖：n=1..60 与多个
 拒绝、非 ASCII、重复键、类型/上限错误、确定性复现、128 个单字节 ASCII
 键全集。
 
+`tests/test_prefix_iteration.py` 覆盖前缀迭代：以 `sorted(原始键列表)`
+为独立参照（不调用被测模块的排序/二分），验证跨多页游标迭代、精确键同时
+是别的键的前缀、零字节键、空前缀匹配全部、空结果、稀有前缀访问键数远小于
+`n`、游标稳定编码与跨字典游标拒绝（`CursorError`）、LCP 与排序置换的
+独立校验，以及旧单键 `lookup` 回归。
+
 ## 仓库布局
 
 ```
-mphf/__init__.py   # 核心库：build / lookup / MPHFTable / 错误与哨兵
-tests/test_mphf.py # 必要测试（独立参考期望值）
-demo.py            # 固定输入演示：正常索引 + 重试 + 拒绝/异常边界
-requirements.txt   # 无第三方依赖（说明性注释）
+mphf/__init__.py              # 核心库：build / lookup / iter_prefix / 错误与哨兵
+tests/test_mphf.py            # 基线必要测试（独立参考期望值）
+tests/test_prefix_iteration.py# 前缀迭代测试（sorted(原字典) 作独立参照）
+demo.py                       # 固定输入演示：正常索引 + 重试 + 拒绝/异常边界
+demo_iteration.py             # 前缀迭代演示：跨页、访问键数、游标绑定
+requirements.txt              # 无第三方依赖（说明性注释）
 ```
