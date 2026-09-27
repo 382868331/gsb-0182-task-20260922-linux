@@ -347,5 +347,176 @@ class AllAsciiCoverageTests(unittest.TestCase):
         self.assertEqual(mphf.lookup(t, b"aa"), -1)
 
 
+class ValuesTests(unittest.TestCase):
+    """build_with_values / lookup_value：变长内容与键绑定。"""
+
+    def test_values_attached_and_lookup(self):
+        keys = det_keys(20)
+        values = [b"v:" + k for k in keys]
+        t = mphf.build_with_values(keys, values)
+        self.assertIsInstance(t, mphf.MPHFTable)
+        self.assertEqual(t.contents, tuple(values))
+        for k, v in zip(keys, values):
+            self.assertEqual(mphf.lookup_value(t, k), v)
+            self.assertEqual(t.lookup_value(k), v)
+        # 键位置与无内容表一致
+        plain = mphf.build(keys)
+        self.assertEqual((t.seed, t.values, t.keys),
+                         (plain.seed, plain.values, plain.keys))
+
+    def test_empty_content_distinct_from_missing(self):
+        t = mphf.build_with_values([b"a", b"b"], [b"", b"x"])
+        self.assertEqual(mphf.lookup_value(t, b"a"), b"")   # 空内容
+        self.assertEqual(mphf.lookup_value(t, b"zz"), mphf.NOT_FOUND)  # 不存在
+        self.assertNotEqual(mphf.lookup_value(t, b"a"), mphf.lookup_value(t, b"zz"))
+        self.assertEqual(t.get_value(b"a"), b"")
+        self.assertIsNone(t.get_value(b"zz"))
+        self.assertEqual(t.get_value(b"zz", "dflt"), "dflt")
+
+    def test_nonmember_never_reads_other_content(self):
+        keys = det_keys(30)
+        values = [f"content-{i}".encode() for i in range(30)]
+        t = mphf.build_with_values(keys, values)
+        for q in (b"", b"k-00 ", b"k-030", b"\xff", b"not-here"):
+            self.assertEqual(mphf.lookup_value(t, q), mphf.NOT_FOUND, q)
+
+    def test_binary_and_nonascii_content(self):
+        t = mphf.build_with_values([b"k1", b"k2"],
+                                   [bytes(range(256)), b"\x00\xff" * 100])
+        self.assertEqual(mphf.lookup_value(t, b"k1"), bytes(range(256)))
+        self.assertEqual(mphf.lookup_value(t, b"k2"), b"\x00\xff" * 100)
+
+    def test_values_validation(self):
+        with self.assertRaises(ValueError):
+            mphf.build_with_values([b"a", b"b"], [b"only-one"])
+        with self.assertRaises(ValueError):
+            mphf.build_with_values([b"a"], [b"x", b"y"])
+        with self.assertRaises(TypeError):
+            mphf.build_with_values([b"a"], ["str"])
+        with self.assertRaises(TypeError):
+            mphf.build_with_values([b"a"], [True])
+        with self.assertRaises(TypeError):
+            mphf.build_with_values([b"a"], b"not-an-iterable-of-values")
+        with self.assertRaises(mphf.DuplicateKeyError):
+            mphf.build_with_values([b"a", b"a"], [b"1", b"2"])
+
+    def test_lookup_value_on_plain_table_rejected(self):
+        t = mphf.build([b"a"])
+        with self.assertRaises(ValueError):
+            mphf.lookup_value(t, b"a")
+        with self.assertRaises(ValueError):
+            mphf.lookup_value(mphf.CONSTRUCTION_FAILED, b"a")
+        with self.assertRaises(TypeError):
+            mphf.lookup_value("not a table", b"a")
+
+    def test_empty_keys_empty_values(self):
+        t = mphf.build_with_values([], [])
+        self.assertEqual(t.size, 0)
+        self.assertEqual(mphf.lookup_value(t, b"x"), mphf.NOT_FOUND)
+
+
+class SerializationTests(unittest.TestCase):
+    """dumps / loads：往返一致、边界与损坏检查。"""
+
+    def roundtrip(self, t):
+        data = mphf.dumps(t)
+        self.assertIsInstance(data, bytes)
+        t2 = mphf.loads(data)
+        self.assertEqual(t2, t)
+        return t2
+
+    def test_roundtrip_preserves_lookup(self):
+        keys = det_keys(50)
+        values = [b"c:" + k for k in keys]
+        t = mphf.build_with_values(keys, values)
+        t2 = self.roundtrip(t)
+        for i, k in enumerate(keys):
+            self.assertEqual(mphf.lookup(t2, k), i)          # 位置一致
+            self.assertEqual(mphf.lookup_value(t2, k), b"c:" + k)  # 内容一致
+        self.assertEqual(mphf.lookup_value(t2, b"absent"), mphf.NOT_FOUND)
+
+    def test_roundtrip_empty_and_plain(self):
+        self.assertEqual(self.roundtrip(mphf.build([])), mphf.build([]))
+        plain = mphf.build(det_keys(10))
+        t2 = self.roundtrip(plain)
+        self.assertEqual(t2.contents, ())
+        with self.assertRaises(ValueError):
+            mphf.lookup_value(t2, b"k-00")
+
+    def test_roundtrip_empty_content_and_binary(self):
+        t = mphf.build_with_values([b"a", b"b", b"c"],
+                                   [b"", bytes(range(256)), b"z" * 70000])
+        t2 = self.roundtrip(t)
+        self.assertEqual(mphf.lookup_value(t2, b"a"), b"")
+        self.assertEqual(mphf.lookup_value(t2, b"c"), b"z" * 70000)
+
+    def test_truncation_every_prefix_rejected(self):
+        t = mphf.build_with_values(det_keys(5), [b"x" * i for i in range(5)])
+        data = mphf.dumps(t)
+        for cut in range(len(data)):
+            with self.assertRaises(mphf.CorruptDataError, msg=f"cut={cut}"):
+                mphf.loads(data[:cut])
+
+    def test_trailing_garbage_rejected(self):
+        data = mphf.dumps(mphf.build([b"a"]))
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(data + b"\x00")
+
+    def test_bad_magic_and_version(self):
+        data = mphf.dumps(mphf.build([b"a"]))
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(b"XXXX" + data[4:])
+        bad = bytearray(data)
+        bad[7] = 9  # version 字段末字节
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(bytes(bad))
+
+    def test_corrupt_length_fields_no_oob(self):
+        t = mphf.build_with_values([b"a", b"b"], [b"hello", b"world"])
+        data = bytearray(mphf.dumps(t))
+        # 逐字节翻转为 0xFF：任何损坏都必须抛 CorruptDataError 或
+        # （对不影响语义的 attempts 字段）仍产生合法表，绝不能越界/崩溃。
+        for i in range(len(data)):
+            bad = bytearray(data)
+            bad[i] ^= 0xFF
+            try:
+                mphf.loads(bytes(bad))
+            except mphf.CorruptDataError:
+                pass
+
+    def test_huge_declared_length_rejected(self):
+        t = mphf.build_with_values([b"a"], [b"hi"])
+        data = bytearray(mphf.dumps(t))
+        # 内容长度字段（末尾 8 字节长度 + 2 字节内容）改为巨大值
+        data[-10:-2] = (2**40).to_bytes(8, "big")
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(bytes(data))
+
+    def test_field_value_validation(self):
+        t = mphf.build([b"a", b"b"])
+        data = bytearray(mphf.dumps(t))
+        # seed 改为 300（越界）
+        data[12:16] = (300).to_bytes(4, "big")
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(bytes(data))
+        # n 改为超限
+        data = bytearray(mphf.dumps(t))
+        data[8:12] = (1001).to_bytes(4, "big")
+        with self.assertRaises(mphf.CorruptDataError):
+            mphf.loads(bytes(data))
+
+    def test_loads_type_errors(self):
+        for bad in (123, "str", None, True, [b"x"]):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                mphf.loads(bad)
+        with self.assertRaises(TypeError):
+            mphf.dumps("not a table")
+
+    def test_loads_accepts_bytes_like(self):
+        data = mphf.dumps(mphf.build([b"a"]))
+        self.assertEqual(mphf.loads(bytearray(data)), mphf.loads(data))
+        self.assertEqual(mphf.loads(memoryview(data)), mphf.loads(data))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

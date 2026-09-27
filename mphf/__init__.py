@@ -33,10 +33,17 @@ __all__ = [
     "MAX_SEED_ATTEMPTS",
     "NOT_FOUND",
     "CONSTRUCTION_FAILED",
+    "FORMAT_MAGIC",
+    "FORMAT_VERSION",
     "MPHFTable",
     "DuplicateKeyError",
+    "CorruptDataError",
     "build",
+    "build_with_values",
     "lookup",
+    "lookup_value",
+    "dumps",
+    "loads",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -52,6 +59,10 @@ MAX_SEED_ATTEMPTS: Final = 256
 #: 非成员查询的返回值。
 NOT_FOUND: Final = -1
 
+#: 序列化格式的魔数与版本（dumps/loads 的线格式标识）。
+FORMAT_MAGIC: Final = b"MPHF"
+FORMAT_VERSION: Final = 1
+
 
 class DuplicateKeyError(ValueError):
     """构造输入中出现重复键。"""
@@ -62,6 +73,14 @@ class DuplicateKeyError(ValueError):
         )
         self.key = key
         self.index = index
+
+
+class CorruptDataError(ValueError):
+    """序列化数据损坏或格式不符（loads 抛出）。
+
+    所有边界问题——截断、长度字段越界、尾部多余字节、非法字段值——
+    都在读取前检查，绝不发生越界读取。
+    """
 
 
 @dataclass(frozen=True)
@@ -93,6 +112,8 @@ class MPHFTable:
         seed:         成功使用的 seed（0..255）；
         values:       每个顶点的赋值 g（0..n-1），长度 m；
         keys:         槽位内容，``keys[i]`` 即构造序号为 i 的键，长度 n；
+        contents:     每个键对应的变长内容，``contents[i]`` 对应序号为 i
+                      的键；空元组表示本表不携带内容（build 的结果）。
         attempts:     成功前尝试的 seed 个数（成功 seed 在内，>=1）。
     """
 
@@ -101,7 +122,8 @@ class MPHFTable:
     seed: int
     values: tuple[int, ...]
     keys: tuple[bytes, ...]
-    attempts: int
+    contents: tuple[bytes, ...] = ()
+    attempts: int = 0
 
     def lookup(self, key: bytes) -> int:
         """实例方法形式，语义同模块级 :func:`lookup`。"""
@@ -111,6 +133,15 @@ class MPHFTable:
         """非成员返回 ``default`` 的便捷方法。"""
         i = lookup(self, key)
         return i if i != NOT_FOUND else default
+
+    def lookup_value(self, key: bytes):
+        """实例方法形式，语义同模块级 :func:`lookup_value`。"""
+        return lookup_value(self, key)
+
+    def get_value(self, key: bytes, default=None):
+        """查内容；非成员返回 ``default``。空内容返回 ``b""``。"""
+        r = lookup_value(self, key)
+        return default if r == NOT_FOUND else r
 
 
 # --------------------------------------------------------------------- 内部
@@ -304,7 +335,11 @@ def build(keys):
         seen.add(key)
         normalized.append(key)
 
-    keys_tuple = tuple(normalized)
+    return _build_from_normalized(tuple(normalized))
+
+
+def _build_from_normalized(keys_tuple: tuple[bytes, ...]):
+    """对已校验的键元组执行构造（build / build_with_values 共用）。"""
     n = len(keys_tuple)
 
     if n == 0:
@@ -315,6 +350,7 @@ def build(keys):
             seed=0,
             values=(),
             keys=(),
+            contents=(),
             attempts=0,
         )
 
@@ -329,9 +365,69 @@ def build(keys):
                 seed=seed,
                 values=tuple(values),
                 keys=keys_tuple,
+                contents=(),
                 attempts=seed + 1,
             )
     return CONSTRUCTION_FAILED
+
+
+def _as_content(raw: object, where: str) -> bytes:
+    """校验并归一化单条变长内容（任意字节，不限 ASCII）。"""
+    if isinstance(raw, bool) or not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"{where}: content must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(raw).__name__}"
+        )
+    return bytes(raw)
+
+
+def build_with_values(keys, values):
+    """构造携带变长内容的完美哈希表。
+
+    Args:
+        keys:   与 :func:`build` 相同的键可迭代对象（同样的校验规则）。
+        values: 与键一一对应的变长内容，可迭代对象；每条为 bytes-like，
+            内容任意（允许非 ASCII、允许空 ``b""``）。长度必须与键数一致。
+
+    Returns:
+        成功返回携带 ``contents`` 的 :class:`MPHFTable`；
+        构造预算耗尽时返回 :data:`CONSTRUCTION_FAILED`。
+
+    Raises:
+        TypeError / ValueError / DuplicateKeyError: 键的校验同 :func:`build`。
+        TypeError:  内容不是 bytes-like（bool 同样拒绝），或 values 不可迭代。
+        ValueError: 键数与内容数不一致。
+    """
+    if isinstance(values, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            "values must be an iterable of bytes-like contents, "
+            "not a single bytes-like object"
+        )
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise TypeError("values must be an iterable of bytes-like contents") from exc
+    contents = tuple(
+        _as_content(raw, where=f"values[{idx}]")
+        for idx, raw in enumerate(iterator)
+    )
+
+    table = build(keys)
+    if table is CONSTRUCTION_FAILED:
+        return CONSTRUCTION_FAILED
+    if len(contents) != table.size:
+        raise ValueError(
+            f"keys/values length mismatch: {table.size} keys vs {len(contents)} values"
+        )
+    return MPHFTable(
+        size=table.size,
+        vertex_count=table.vertex_count,
+        seed=table.seed,
+        values=table.values,
+        keys=table.keys,
+        contents=contents,
+        attempts=table.attempts,
+    )
 
 
 def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
@@ -382,3 +478,209 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+def lookup_value(table: "MPHFTable | ConstructionFailure", key):
+    """查询键对应的变长内容。
+
+    Args:
+        table: :func:`build_with_values` 返回的 :class:`MPHFTable`。
+        key:   bytes-like，规则同 :func:`lookup`。
+
+    Returns:
+        成员返回其内容 ``bytes``（空内容返回 ``b""``，与不存在明确
+        区分）；非成员返回 :data:`NOT_FOUND`（`-1`）。
+
+    Raises:
+        TypeError:  表对象类型错误，或键不是 bytes-like。
+        ValueError: 对 :data:`CONSTRUCTION_FAILED` 查询，或表不携带内容
+            （由 :func:`build` 构造、未经 ``build_with_values``）。
+    """
+    if table is CONSTRUCTION_FAILED:
+        raise ValueError(
+            "cannot lookup in CONSTRUCTION_FAILED: build exhausted its seed budget"
+        )
+    if not isinstance(table, MPHFTable):
+        raise TypeError(
+            f"table must be an MPHFTable produced by build(), got {type(table).__name__}"
+        )
+    if table.size > 0 and not table.contents:
+        raise ValueError(
+            "table carries no contents; use build_with_values() to attach values"
+        )
+    slot = lookup(table, key)
+    if slot == NOT_FOUND:
+        return NOT_FOUND
+    return table.contents[slot]
+
+
+# ------------------------------------------------------------------ 序列化
+#
+# 线格式（全部大端，无浮点）：
+#   magic   4 字节   b"MPHF"
+#   version u32      1
+#   n       u32      键数量（<= MAX_KEYS）
+#   m       u32      顶点数，必须等于 ceil(1.4 n)（n=0 时须为 0）
+#   seed    u32      0..255
+#   attempts u32     >=0
+#   g       m × u32  顶点赋值，每个 < n（n=0 时无此段）
+#   keys    n 段     每段 u32 长度 + 原始键字节（ASCII）
+#   flag    u8       1 = 携带内容，0 = 不携带
+#   contents n 段    仅 flag=1：每段 u64 长度 + 内容字节（任意字节）
+# 之后不允许有任何多余字节。
+
+_U32_MAX: Final = 0xFFFFFFFF
+
+
+def dumps(table: MPHFTable) -> bytes:
+    """把表（含内容）序列化为字节串。
+
+    Raises:
+        TypeError: 参数不是 :class:`MPHFTable`。
+    """
+    if not isinstance(table, MPHFTable):
+        raise TypeError(
+            f"table must be an MPHFTable, got {type(table).__name__}"
+        )
+    n, m = table.size, table.vertex_count
+    out = bytearray()
+    out += FORMAT_MAGIC
+    out += FORMAT_VERSION.to_bytes(4, "big")
+    out += n.to_bytes(4, "big")
+    out += m.to_bytes(4, "big")
+    out += table.seed.to_bytes(4, "big")
+    out += table.attempts.to_bytes(4, "big")
+    for gv in table.values:
+        out += gv.to_bytes(4, "big")
+    for k in table.keys:
+        out += len(k).to_bytes(4, "big")
+        out += k
+    has_contents = bool(table.contents)
+    out += bytes((1 if has_contents else 0,))
+    if has_contents:
+        for c in table.contents:
+            out += len(c).to_bytes(8, "big")
+            out += c
+    return bytes(out)
+
+
+class _Reader:
+    """带边界检查的字节游标：任何读取前先验证剩余长度。"""
+
+    __slots__ = ("data", "pos")
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    def take(self, count: int, what: str) -> bytes:
+        end = self.pos + count
+        if end > len(self.data):
+            raise CorruptDataError(
+                f"truncated data: need {count} bytes for {what} at offset "
+                f"{self.pos}, only {len(self.data) - self.pos} left"
+            )
+        chunk = self.data[self.pos:end]
+        self.pos = end
+        return chunk
+
+    def u32(self, what: str) -> int:
+        return int.from_bytes(self.take(4, what), "big")
+
+    def u64(self, what: str) -> int:
+        return int.from_bytes(self.take(8, what), "big")
+
+
+def loads(data) -> MPHFTable:
+    """从字节串重建表；损坏数据抛 :class:`CorruptDataError`。
+
+    所有长度字段在使用前与剩余字节数核对，不会发生越界读取；
+    字段取值（顶点数、seed、g 值范围、键的 ASCII 与唯一性、flag、
+    尾部多余字节）也全部校验。重建后的表与保存前逐字段一致，
+    查询行为（键的位置与结果）不变。
+
+    Raises:
+        TypeError: 参数不是 bytes-like。
+        CorruptDataError: 数据截断、长度越界、字段非法或有多余字节。
+    """
+    if isinstance(data, bool) or not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"data must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(data).__name__}"
+        )
+    r = _Reader(bytes(data))
+
+    if r.take(4, "magic") != FORMAT_MAGIC:
+        raise CorruptDataError("bad magic: not an MPHF archive")
+    version = r.u32("version")
+    if version != FORMAT_VERSION:
+        raise CorruptDataError(f"unsupported format version: {version}")
+
+    n = r.u32("key count n")
+    if n > MAX_KEYS:
+        raise CorruptDataError(f"key count {n} exceeds limit {MAX_KEYS}")
+    m = r.u32("vertex count m")
+    expected_m = _vertex_count(n) if n else 0
+    if m != expected_m:
+        raise CorruptDataError(
+            f"vertex count {m} inconsistent with n={n} (expected {expected_m})"
+        )
+    seed = r.u32("seed")
+    if seed >= MAX_SEED_ATTEMPTS:
+        raise CorruptDataError(f"seed {seed} out of range 0..{MAX_SEED_ATTEMPTS - 1}")
+    attempts = r.u32("attempts")
+
+    values = []
+    for i in range(m):
+        gv = r.u32(f"g[{i}]")
+        if n and gv >= n:
+            raise CorruptDataError(f"g[{i}]={gv} out of range 0..{n - 1}")
+        values.append(gv)
+
+    keys = []
+    seen: set[bytes] = set()
+    for i in range(n):
+        klen = r.u32(f"key[{i}] length")
+        # 长度先与剩余字节核对（take 内部再次检查），不据此分配超额内存。
+        if klen > len(r.data) - r.pos:
+            raise CorruptDataError(
+                f"key[{i}] length {klen} exceeds remaining "
+                f"{len(r.data) - r.pos} bytes"
+            )
+        k = r.take(klen, f"key[{i}]")
+        if not all(ch < 0x80 for ch in k):
+            raise CorruptDataError(f"key[{i}] contains non-ASCII bytes")
+        if k in seen:
+            raise CorruptDataError(f"duplicate key in archive: {k!r}")
+        seen.add(k)
+        keys.append(k)
+
+    flag = r.take(1, "contents flag")[0]
+    if flag not in (0, 1):
+        raise CorruptDataError(f"contents flag must be 0 or 1, got {flag}")
+
+    contents: list[bytes] = []
+    if flag == 1:
+        for i in range(n):
+            clen = r.u64(f"content[{i}] length")
+            if clen > len(r.data) - r.pos:
+                raise CorruptDataError(
+                    f"content[{i}] length {clen} exceeds remaining "
+                    f"{len(r.data) - r.pos} bytes"
+                )
+            contents.append(r.take(clen, f"content[{i}]"))
+
+    if r.pos != len(r.data):
+        raise CorruptDataError(
+            f"trailing garbage: {len(r.data) - r.pos} unexpected bytes at end"
+        )
+
+    return MPHFTable(
+        size=n,
+        vertex_count=m,
+        seed=seed,
+        values=tuple(values),
+        keys=tuple(keys),
+        contents=tuple(contents),
+        attempts=attempts,
+    )

@@ -6,7 +6,9 @@
 1. 正常构造与索引（含 n=1000 接口边界、非成员、哈希碰撞非成员）；
 2. seed 重试：真实不可剥离集合 {a,b,i} 在 seed=0 失败、seed=2 成功；
 3. 重试上限被实际触发：把预算压为 1，公开 build() 返回 construction_failed；
-4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
+4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）；
+5. 变长内容：空内容与不存在分开，序列化保存后重新加载，结果一致；
+   损坏/错误长度数据被明确拒绝（不越界读取）。
 """
 
 from __future__ import annotations
@@ -96,6 +98,45 @@ def main() -> None:
     show_failure("键类型为 str/int/bool", lambda: mphf.build([b"ok", "nope"]))
     show_failure("把单个 bytes 当集合", lambda: mphf.build(b"abc"))
     show_failure("lookup 键类型为 int", lambda: mphf.lookup(mphf.build([b"a"]), 123))
+    print()
+
+    # ---------- 5. 变长内容 + 保存/重新加载 + 损坏检查 ----------------------
+    hr("5. 变长内容：保存到字节串并重新加载")
+    keys = [b"alpha", b"beta", b"gamma", b"empty", b"binary"]
+    contents = [
+        b"the first letter is A",
+        b"",                                          # 空内容
+        "γ".encode("utf-8") + b" \x00\xff",        # 任意字节内容
+        b"",                                          # 又一个空内容
+        b"last-doc",
+    ]
+    t = mphf.build_with_values(keys, contents)
+    for k in keys:
+        print(f"  lookup_value({k!r}) -> {t.lookup_value(k)!r}")
+    print(f"  空内容 lookup_value(b'beta') == b'': {t.lookup_value(b'beta') == b''}")
+    print(f"  不存在 lookup_value(b'omega') -> {t.lookup_value(b'omega')}（NOT_FOUND）")
+    print("  不存在不能读到别人的内容: "
+          f"{t.get_value(b'omega', 'SENTINEL') == 'SENTINEL'}")
+
+    blob = mphf.dumps(t)
+    t2 = mphf.loads(blob)
+    print(f"  dumps 得到 {len(blob)} 字节；loads 后表逐字段相等: {t2 == t}")
+    for k in keys:
+        assert t2.lookup(k) == t.lookup(k)
+        assert t2.lookup_value(k) == t.lookup_value(k)
+    print("  重新加载后每个键的位置（序号）与查询内容均与保存前一致")
+
+    # 主动损坏：把末尾内容长度字段改大——必须拒绝而不是越界读取
+    bad = bytearray(blob)
+    bad[-16:-8] = (10**9).to_bytes(8, "big")
+    try:
+        mphf.loads(bytes(bad))
+    except mphf.CorruptDataError as exc:
+        print(f"  错误长度信息被拒绝: {type(exc).__name__}: {exc}")
+    try:
+        mphf.loads(blob + b"x")
+    except mphf.CorruptDataError as exc:
+        print(f"  尾部多余字节被拒绝: {exc}")
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
 

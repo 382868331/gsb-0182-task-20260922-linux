@@ -18,7 +18,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（31 个用例）
+# 必要测试（49 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（当场真实计算，实测约 0.1 秒，远低于 8 秒预算；无 sleep、无预录）
@@ -36,7 +36,47 @@ mphf.lookup(table, b"beta")      # -> 1
 mphf.lookup(table, b"absent")    # -> mphf.NOT_FOUND (-1)
 table.lookup(b"alpha")           # 实例方法，等价
 table.get(b"absent", default=None)
+
+# 携带每个键的变长内容，保存并重新加载
+t = mphf.build_with_values([b"alpha", b"beta"], [b"A-doc", b""])
+t.lookup_value(b"beta")          # -> b""（空内容）
+t.lookup_value(b"absent")        # -> mphf.NOT_FOUND (-1，不存在)
+t.get_value(b"absent", None)     # -> None，默认值
+blob = mphf.dumps(t)              # 整个结果（表+内容）序列化为 bytes
+t2 = mphf.loads(blob)             # 重新加载；损坏数据抛 CorruptDataError
 ```
+
+### `build_with_values(keys, values) -> MPHFTable | CONSTRUCTION_FAILED`
+
+- 键的规则、重试、错误语义与 `build` 完全相同。
+- `values`：与键一一对应的可迭代对象；每条为 bytes-like，**内容任意**
+  （允许非 ASCII、NUL、二进制），允许空字节串 `b""`。
+- 键数与内容数必须相等，否则 `ValueError`；内容为非 bytes-like（含
+  `bool`）或把单个 bytes 误当作内容集合时抛 `TypeError`。
+- 成功返回的 `MPHFTable` 多出 `contents` 字段（元组，长度 n）。
+
+### `lookup_value(table, key) -> bytes | NOT_FOUND`
+
+- 成员：返回其内容 `bytes`（**空内容返回 `b""`**）。
+- 非成员：返回 `NOT_FOUND`（`-1`），与空内容明确分开；非成员不会读到
+  其他键的内容——先经完整键终检定位，终检不通过直接返回不存在。
+- 对 `build()` 构造的无内容表调用抛 `ValueError`（不是静默返回空）；
+  另有实例方法 `table.lookup_value` 与 `table.get_value(key, default=None)`。
+
+### `dumps(table) / loads(data)`：保存与重新加载
+
+- `dumps` 把整个表（含完整键与变长内容）编码为 `bytes`；`loads` 重建为
+  逐字段相等的不可变 `MPHFTable`。seed、顶点表与完整键全部保存，因此
+  重新加载后键的位置（序号）与 `lookup`/`lookup_value` 结果与保存前一致。
+- 线格式（大端、无浮点）：魔数 `b"MPHF"` + u32 版本；u32 `n,m,seed,
+  attempts`；`m` 个 u32 顶点赋值 `g`（每个 `< n`）；n 段
+  `u32 长度 + 键字节`（ASCII）；u8 内容标志；标志为 1 时 n 段
+  `u64 长度 + 内容字节`（任意字节）。之后不允许多余字节。
+- `loads` 对每个长度字段在读取前与剩余字节数核对，**截断、长度越界、
+  尾部垃圾、魔数/版本不符、`m` 与 `n` 不一致、seed/g 值越界、非 ASCII
+  或重复键、非法标志**一律抛 `mphf.CorruptDataError`（`ValueError`
+  子类）——错误的长度信息不可能造成越界读取。输入不是 bytes-like 时
+  抛 `TypeError`。常量 `mphf.FORMAT_MAGIC` / `mphf.FORMAT_VERSION` 可查。
 
 ### `build(keys) -> MPHFTable | CONSTRUCTION_FAILED`
 
@@ -59,6 +99,7 @@ table.get(b"absent", default=None)
 | `values` | 每个顶点的赋值 `g`，`0..n-1` 的元组，长度 `m` |
 | `keys` | 槽位内容，`keys[i]` 即构造序号为 `i` 的原始键，长度 `n` |
 | `attempts` | 成功前尝试的 seed 个数（成功 seed 在内，≥1；空表为 0） |
+| `contents` | 每键的变长内容，长度 n；仅 `build_with_values` 产生，`build` 为空元组 |
 
 ### `lookup(table, key) -> int`
 
@@ -112,6 +153,10 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 | 256 个 seed 全部失败 | **返回** `CONSTRUCTION_FAILED`（不抛异常） |
 | 对 `CONSTRUCTION_FAILED` 调用 `lookup` | `ValueError` |
 | 对非 `MPHFTable` 对象 `lookup` | `TypeError` |
+| 键数与内容数不一致 / 对无内容表 `lookup_value` | `ValueError` |
+| 内容不是 bytes-like（含 `bool`）、`values` 是单个 bytes | `TypeError` |
+| `dumps` 参数非 `MPHFTable`、`loads` 参数非 bytes-like | `TypeError` |
+| 归档截断/长度越界/尾部垃圾/字段非法/魔数版本不符 | `mphf.CorruptDataError`（`ValueError` 子类） |
 
 **搜索预算耗尽 ≠ 证明无解**：`CONSTRUCTION_FAILED` 只表示“seed 0..255
 在本算法（固定 `m=1.4n`、三哈希、SHA256 线格式）下均未成功”，是**预算
@@ -149,13 +194,17 @@ build→lookup 的往返一致仅作为补充断言。覆盖：n=1..60 与多个
 双射、n=1000 边界、空表、真实 seed-0 不可剥离集合 `{a,b,i}`（seed=2
 重试成功）、预算压为 1 时实际触发 `construction_failed`、非成员哈希碰撞
 拒绝、非 ASCII、重复键、类型/上限错误、确定性复现、128 个单字节 ASCII
-键全集。
+键全集；以及变长内容（空内容/不存在分离、非成员读不到他人内容、二进制
+内容）、dumps/loads 往返一致（含空表/无内容表/70 KB 大内容）、每个前缀
+截断、逐字节翻转损坏、超长声明长度、非法 seed/n/版本/魔数/尾部字节等
+边界与损坏检查。
 
 ## 仓库布局
 
 ```
-mphf/__init__.py   # 核心库：build / lookup / MPHFTable / 错误与哨兵
+mphf/__init__.py   # 核心库：build / build_with_values / lookup(_value) /
+                   #         dumps / loads / MPHFTable / 错误与哨兵
 tests/test_mphf.py # 必要测试（独立参考期望值）
-demo.py            # 固定输入演示：正常索引 + 重试 + 拒绝/异常边界
+demo.py            # 固定输入演示：正常索引 + 重试 + 拒绝边界 + 内容保存/加载
 requirements.txt   # 无第三方依赖（说明性注释）
 ```
