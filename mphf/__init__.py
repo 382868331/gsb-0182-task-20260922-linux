@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import struct
 from dataclasses import dataclass
 from math import gcd
 from typing import Final
@@ -37,6 +39,12 @@ __all__ = [
     "DuplicateKeyError",
     "build",
     "lookup",
+    "fetch",
+    "dumps",
+    "loads",
+    "save",
+    "load",
+    "ArchiveFormatError",
 ]
 
 #: 输入键数量上限（接口边界）。
@@ -51,6 +59,17 @@ MAX_SEED_ATTEMPTS: Final = 256
 
 #: 非成员查询的返回值。
 NOT_FOUND: Final = -1
+
+#: 归档魔数与格式版本（v1 为键 + 变长内容的自描述二进制格式）。
+_MAGIC: Final = b"MPHF0001"
+
+
+class ArchiveFormatError(ValueError):
+    """归档字节流损坏、截断、长度越界或自校验失败。
+
+    所有“按文件中的长度字段切片”的操作都先做边界检查：长度信息错误只会
+    得到本异常，绝不会造成越界读取或读到其他键的内容。
+    """
 
 
 class DuplicateKeyError(ValueError):
@@ -94,6 +113,8 @@ class MPHFTable:
         values:       每个顶点的赋值 g（0..n-1），长度 m；
         keys:         槽位内容，``keys[i]`` 即构造序号为 i 的键，长度 n；
         attempts:     成功前尝试的 seed 个数（成功 seed 在内，>=1）。
+        contents:     与槽位平行的变长内容，``contents[i]`` 即 ``keys[i]``
+                      对应的原始字节；未显式给定时全部为空字节串。
     """
 
     size: int
@@ -102,6 +123,7 @@ class MPHFTable:
     values: tuple[int, ...]
     keys: tuple[bytes, ...]
     attempts: int
+    contents: tuple[bytes, ...] = ()
 
     def lookup(self, key: bytes) -> int:
         """实例方法形式，语义同模块级 :func:`lookup`。"""
@@ -111,6 +133,27 @@ class MPHFTable:
         """非成员返回 ``default`` 的便捷方法。"""
         i = lookup(self, key)
         return i if i != NOT_FOUND else default
+
+    def fetch(self, key: bytes):
+        """实例方法形式，语义同模块级 :func:`fetch`。"""
+        return fetch(self, key)
+
+    def get_content(self, key: bytes, default=None):
+        """命中返回内容（可能是 ``b""``）；非成员返回 ``default``。
+
+        与 :meth:`fetch` 的区别仅在于非成员语义：``default`` 默认是
+        ``None``，因此空内容 ``b""`` 与不存在（``None``）天然可区分。
+        """
+        i = lookup(self, key)
+        return self.contents[i] if i != NOT_FOUND else default
+
+    def dumps(self) -> bytes:
+        """实例方法形式，语义同模块级 :func:`dumps`。"""
+        return dumps(self)
+
+    def save(self, path: str | bytes | os.PathLike) -> None:
+        """实例方法形式，语义同模块级 :func:`save`。"""
+        save(self, path)
 
 
 # --------------------------------------------------------------------- 内部
@@ -263,13 +306,17 @@ def _try_seed(
 # --------------------------------------------------------------------- 公开
 
 
-def build(keys):
+def build(keys, contents=None):
     """构造最小访问完美哈希表。
 
     Args:
         keys: 键的可迭代对象，每个键为 ASCII ``bytes``（或 bytearray /
             memoryview），1..1000 条且不得重复；空可迭代对象产生空表
             （``size == 0``，任何查询返回 :data:`NOT_FOUND`）。
+        contents: 可选的、与 ``keys`` 等长等序的可迭代对象，每项为
+            bytes-like，作为该键的变长内容保存（允许空字节串 ``b""``，
+            这是合法内容，与“键不存在”严格区分）。省略时每个键的内容
+            为空字节串。
 
     Returns:
         成功返回 :class:`MPHFTable`；全部 256 个 seed 均失败时返回哨兵
@@ -281,6 +328,7 @@ def build(keys):
             不是 bytes-like（``bool`` 也在此拒绝）。
         ValueError: 键含非 ASCII 字节、数量超过 1000。
         DuplicateKeyError: 存在重复键（ValueError 子类），消息带重复位置。
+        ValueError: ``contents`` 与 ``keys`` 长度不一致。
     """
     if isinstance(keys, (bytes, bytearray, memoryview)):
         raise TypeError(
@@ -304,6 +352,42 @@ def build(keys):
         seen.add(key)
         normalized.append(key)
 
+    content_values: tuple[bytes, ...]
+    if contents is None:
+        content_values = tuple(b"" for _ in normalized)
+    else:
+        if isinstance(contents, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "contents must be an iterable of bytes values, "
+                "not a single bytes-like object"
+            )
+        try:
+            citerator = iter(contents)
+        except TypeError as exc:
+            raise TypeError("contents must be an iterable of bytes values") from exc
+        collected: list[bytes] = []
+        for cidx, raw_content in enumerate(citerator):
+            if cidx >= len(normalized):
+                # 不等长是明确的契约错误，立刻中止，不继续消费迭代器。
+                raise ValueError(
+                    f"contents has at least {cidx + 1} items but keys has "
+                    f"{len(normalized)}"
+                )
+            if isinstance(raw_content, bool) or not isinstance(
+                raw_content, (bytes, bytearray, memoryview)
+            ):
+                raise TypeError(
+                    f"contents[{cidx}]: value must be bytes-like "
+                    f"(bytes/bytearray/memoryview), got {type(raw_content).__name__}"
+                )
+            collected.append(bytes(raw_content))
+        if len(collected) != len(normalized):
+            raise ValueError(
+                f"contents length {len(collected)} does not match keys length "
+                f"{len(normalized)}"
+            )
+        content_values = tuple(collected)
+
     keys_tuple = tuple(normalized)
     n = len(keys_tuple)
 
@@ -316,6 +400,7 @@ def build(keys):
             values=(),
             keys=(),
             attempts=0,
+            contents=(),
         )
 
     m = _vertex_count(n)
@@ -330,6 +415,7 @@ def build(keys):
                 values=tuple(values),
                 keys=keys_tuple,
                 attempts=seed + 1,
+                contents=content_values,
             )
     return CONSTRUCTION_FAILED
 
@@ -382,3 +468,249 @@ def lookup(table: "MPHFTable | ConstructionFailure", key) -> int:
     if table.keys[slot] == raw:
         return slot
     return NOT_FOUND
+
+
+def fetch(table: "MPHFTable | ConstructionFailure", key):
+    """查询键对应的变长内容。
+
+    Args:
+        table: :func:`build` 返回的 :class:`MPHFTable`。
+        key:   bytes-like；非 ASCII 字节串按必为非成员处理。
+
+    Returns:
+        成员返回其内容 ``bytes``（内容可以是空字节串 ``b""``）；
+        非成员返回 :data:`NOT_FOUND`（``-1``，一个 ``int``，不可能与任何
+        ``bytes`` 内容混淆），因此**空内容与不存在被严格区分**。
+
+    Raises:
+        TypeError:  表对象或键的类型错误。
+        ValueError: 对 :data:`CONSTRUCTION_FAILED` 哨兵查询。
+    """
+    slot = lookup(table, key)
+    if slot == NOT_FOUND:
+        return NOT_FOUND
+    return table.contents[slot]
+
+
+# --------------------------------------------------------------- 归档格式
+
+# 布局（全部多字节整数均为无符号大端）：
+#
+#   magic(8)=b"MPHF0001" | n uint32 | m uint32 | seed uint8 | attempts uint32
+#   | n 个 uint32 顶点赋值 g
+#   | n 条记录，每条 = klen uint32 | key bytes | clen uint32 | content bytes
+#   | sha256(body) 32 字节
+#
+# 长度字段全部在切片前与“剩余可用字节”比较：错误的长度只会触发
+# ArchiveFormatError，绝不越界，也不会把下一条记录或其他键的内容读出。
+
+
+def _check_uint(value: object, name: str, bits: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ArchiveFormatError(f"corrupt header: {name} is not an integer")
+    if value < 0 or value >= (1 << bits):
+        raise ArchiveFormatError(f"corrupt header: {name} out of range")
+    return value
+
+
+def dumps(table: "MPHFTable") -> bytes:
+    """把表（含每个键的变长内容）序列化为自校验字节串。
+
+    Raises:
+        TypeError:  ``table`` 不是 :class:`MPHFTable`（失败哨兵也被拒绝）。
+    """
+    if not isinstance(table, MPHFTable):
+        raise TypeError(
+            "table must be an MPHFTable produced by build(); "
+            f"got {type(table).__name__}"
+        )
+
+    n = table.size
+    m = table.vertex_count
+    if len(table.keys) != n or len(table.contents) != n:
+        raise ArchiveFormatError("in-memory table has inconsistent record count")
+    if len(table.values) != m:
+        raise ArchiveFormatError("in-memory table has inconsistent value count")
+
+    out = bytearray()
+    out += _MAGIC
+    out += struct.pack(">II", n, m)
+    out += struct.pack(">BI", table.seed, table.attempts)
+    for g in table.values:
+        out += struct.pack(">I", g)
+    for key, content in zip(table.keys, table.contents):
+        out += struct.pack(">I", len(key))
+        out += key
+        out += struct.pack(">I", len(content))
+        out += content
+    digest = hashlib.sha256(bytes(out)).digest()
+    out += digest
+    return bytes(out)
+
+
+def loads(data) -> "MPHFTable":
+    """从 :func:`dumps` 的字节串重建表。
+
+    重建后槽位赋值与查询结果与保存前完全一致；非成员查询仍明确返回
+    :data:`NOT_FOUND`，不会读到其他键的内容。
+
+    Raises:
+        TypeError:          ``data`` 不是 bytes-like。
+        ArchiveFormatError: 截断、魔数/字段错误、长度越界或校验和不匹配。
+    """
+    if isinstance(data, bool) or not isinstance(
+        data, (bytes, bytearray, memoryview)
+    ):
+        raise TypeError(
+            "data must be bytes-like (bytes/bytearray/memoryview), "
+            f"got {type(data).__name__}"
+        )
+    blob = bytes(data)
+
+    if len(blob) < len(_MAGIC) + 32:
+        raise ArchiveFormatError("archive truncated: shorter than magic + checksum")
+    if blob[: len(_MAGIC)] != _MAGIC:
+        raise ArchiveFormatError("bad magic: not an MPHF v1 archive")
+
+    body = blob[:-32]
+    stored_digest = blob[-32:]
+    if hashlib.sha256(body).digest() != stored_digest:
+        raise ArchiveFormatError("checksum mismatch: archive is corrupted")
+
+    pos = len(_MAGIC)
+    end = len(body)
+
+    def take(count: int, what: str) -> bytes:
+        nonlocal pos
+        if count < 0 or pos + count > end:
+            raise ArchiveFormatError(f"corrupt archive: truncated while reading {what}")
+        chunk = body[pos : pos + count]
+        pos += count
+        return chunk
+
+    n = _check_uint(struct.unpack(">I", take(4, "n"))[0], "n", 32)
+    m = _check_uint(struct.unpack(">I", take(4, "m"))[0], "m", 32)
+    if n > MAX_KEYS:
+        raise ArchiveFormatError(f"corrupt header: n={n} exceeds limit {MAX_KEYS}")
+    if n != 0 and m != _vertex_count(n):
+        raise ArchiveFormatError(
+            f"corrupt header: m={m} inconsistent with n={n} (want {_vertex_count(n)})"
+        )
+    if n == 0 and m != 0:
+        raise ArchiveFormatError("corrupt header: empty table must have m=0")
+
+    seed = _check_uint(struct.unpack(">B", take(1, "seed"))[0], "seed", 8)
+    attempts = _check_uint(
+        struct.unpack(">I", take(4, "attempts"))[0], "attempts", 32
+    )
+
+    values_list: list[int] = []
+    for i in range(m):
+        g = _check_uint(
+            struct.unpack(">I", take(4, f"g[{i}]"))[0], f"g[{i}]", 32
+        )
+        if n != 0 and g >= n:
+            raise ArchiveFormatError(f"corrupt value g[{i}]={g} out of range for n={n}")
+        values_list.append(g)
+
+    keys_list: list[bytes] = []
+    contents_list: list[bytes] = []
+    seen: set[bytes] = set()
+    for i in range(n):
+        klen = _check_uint(
+            struct.unpack(">I", take(4, f"key[{i}].length"))[0],
+            f"key[{i}].length",
+            32,
+        )
+        # take 先与剩余长度比较：伪造的巨大 klen 在此被拒绝，不会越界。
+        key = take(klen, f"key[{i}] bytes")
+        if not all(ch < 0x80 for ch in key):
+            raise ArchiveFormatError(f"corrupt key[{i}]: non-ASCII byte in archive")
+        if key in seen:
+            raise ArchiveFormatError(f"corrupt archive: duplicate key at slot {i}")
+        seen.add(key)
+
+        clen = _check_uint(
+            struct.unpack(">I", take(4, f"content[{i}].length"))[0],
+            f"content[{i}].length",
+            32,
+        )
+        # 长度只用于在边界内切片；绝不会读到相邻记录。
+        content = take(clen, f"content[{i}] bytes")
+        keys_list.append(key)
+        contents_list.append(content)
+
+    if pos != end:
+        raise ArchiveFormatError("corrupt archive: trailing bytes after all records")
+
+    table = MPHFTable(
+        size=n,
+        vertex_count=m,
+        seed=seed,
+        values=tuple(values_list),
+        keys=tuple(keys_list),
+        attempts=attempts,
+        contents=tuple(contents_list),
+    )
+    # 强不变量：重载结果的槽位必须仍是 0..n-1 的排列（保存格式被篡改导致
+    # 的结构性错误即使通过校验和也无法在此被信任——校验和已排除该情形，
+    # 这里做最终一致性确认）。
+    if n != 0:
+        slots = [lookup(table, k) for k in table.keys]
+        if sorted(slots) != list(range(n)):
+            raise ArchiveFormatError("corrupt archive: restored slots are not a bijection")
+    return table
+
+
+def save(table: "MPHFTable", path) -> None:
+    """把表原子地写入文件：先写同目录临时文件再替换，失败不留半成品。
+
+    Raises:
+        TypeError: ``table`` 类型错误或 ``path`` 不是合法路径类型。
+        OSError:  文件系统层面的写入/替换失败。
+    """
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        raise TypeError(f"path must be str/bytes/os.PathLike, got {type(path).__name__}")
+    payload = dumps(table)
+    final = os.fspath(path)
+    directory = os.path.dirname(final) or os.curdir
+    fd, tmp_path = _mktemp_in(directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _mktemp_in(directory: str) -> tuple[int, str]:
+    """在目标目录创建唯一临时文件（标准库实现，避免引入依赖）。"""
+    import uuid
+
+    name = f".mphf-tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    path = os.path.join(directory, name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags, 0o600), path
+
+
+def load(path) -> "MPHFTable":
+    """从文件读取并用 :func:`loads` 校验、重建表。
+
+    Raises:
+        TypeError:          ``path`` 不是合法路径类型。
+        OSError:           文件无法读取。
+        ArchiveFormatError: 内容截断、长度越界、损坏或校验失败。
+    """
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        raise TypeError(f"path must be str/bytes/os.PathLike, got {type(path).__name__}")
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    return loads(blob)

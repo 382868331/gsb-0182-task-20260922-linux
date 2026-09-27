@@ -4,13 +4,17 @@
 
 展示：
 1. 正常构造与索引（含 n=1000 接口边界、非成员、哈希碰撞非成员）；
+   每个键保存变长内容，空内容与不存在分开处理；
 2. seed 重试：真实不可剥离集合 {a,b,i} 在 seed=0 失败、seed=2 成功；
 3. 重试上限被实际触发：把预算压为 1，公开 build() 返回 construction_failed；
-4. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
+4. 保存到文件并重新加载，槽位与查询结果一致；损坏归档被明确拒绝；
+5. 非法输入实际抛出异常（重复键、非 ASCII、超上限、类型错误）。
 """
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 from unittest.mock import patch
 
@@ -60,6 +64,18 @@ def main() -> None:
     print(f"  非成员 {collider!r} 的哈希落到已占用槽位 {slot(collider)}，"
           f"lookup 仍返回 {mphf.lookup(table, collider)}（完整键终检）")
 
+    # ---------- 1b. 变长内容：空内容与不存在严格分开 ---------------------
+    hr("1b. 变长内容：空内容 ≠ 不存在")
+    docs = [b"doc-a", b"doc-b", b"doc-c"]
+    payloads = [b"alpha content", b"", bytes([0, 1, 2, 255])]
+    ctable = mphf.build(docs, payloads)
+    for k in docs:
+        print(f"  fetch({k!r}) -> {mphf.fetch(ctable, k)!r}")
+    print(f"  空内容 fetch(b'doc-b') == b'': {mphf.fetch(ctable, b'doc-b') == b''}")
+    print(f"  不存在 fetch(b'doc-x') -> {mphf.fetch(ctable, b'doc-x')}（-1 = NOT_FOUND）")
+    assert mphf.fetch(ctable, b"doc-b") == b""
+    assert mphf.fetch(ctable, b"doc-x") == mphf.NOT_FOUND
+
     # ---------- 2. 确定性重试：真实的 seed=0 不可剥离集合 ------------------
     hr("2. 超图不可剥离 → seed 递增重试")
     tricky = [b"a", b"b", b"i"]
@@ -80,8 +96,51 @@ def main() -> None:
     except ValueError as exc:
         print(f"  对失败哨兵 lookup 抛出 ValueError: {exc}")
 
-    # ---------- 4. 实际触发的拒绝/异常边界 ---------------------------------
-    hr("4. 非法输入拒绝（可定位错误，不静默纠正）")
+    # ---------- 4. 保存 / 重新加载 / 损坏拒绝 ------------------------------
+    hr("4. 保存到文件并重新加载（边界与损坏检查）")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = os.path.join(tmpdir, "docs.mphf")
+        ctable.save(archive_path)
+        raw = open(archive_path, "rb").read()
+        print(f"  归档字节数 {len(raw)}（魔数 {raw[:8]!r}，末尾 32 字节为 SHA256）")
+        reloaded = mphf.load(archive_path)
+        for k in docs:
+            before = (mphf.lookup(ctable, k), mphf.fetch(ctable, k))
+            after = (mphf.lookup(reloaded, k), mphf.fetch(reloaded, k))
+            assert before == after
+        print("  重载后每个键的槽位与内容与保存前完全一致")
+        print(f"  重载表非成员查询 lookup(b'doc-x') -> "
+              f"{mphf.lookup(reloaded, b'doc-x')}（仍明确不存在）")
+
+        # 真实损坏一个字节：校验和必须拒绝。
+        corrupt = os.path.join(tmpdir, "corrupt.mphf")
+        broken = bytearray(raw)
+        broken[40] ^= 0xFF
+        with open(corrupt, "wb") as fh:
+            fh.write(broken)
+        try:
+            mphf.load(corrupt)
+        except mphf.ArchiveFormatError as exc:
+            print(f"  翻转 1 字节后加载抛出 ArchiveFormatError: {exc}")
+
+        # 伪造巨大的长度字段并重算校验和：边界检查仍必须拒绝，不越界。
+        import hashlib
+        import struct as _struct
+
+        body = bytearray(raw[:-32])
+        n, m = ctable.size, ctable.vertex_count
+        klen_pos = 21 + 4 * m
+        body[klen_pos : klen_pos + 4] = _struct.pack(">I", 0xFFFFFFFF)
+        evil = os.path.join(tmpdir, "evil-length.mphf")
+        with open(evil, "wb") as fh:
+            fh.write(bytes(body) + hashlib.sha256(bytes(body)).digest())
+        try:
+            mphf.load(evil)
+        except mphf.ArchiveFormatError as exc:
+            print(f"  错误长度信息（重算校验和）仍被拒绝: {exc}")
+
+    # ---------- 5. 实际触发的拒绝/异常边界 ---------------------------------
+    hr("5. 非法输入拒绝（可定位错误，不静默纠正）")
 
     def show_failure(label, fn):
         try:
@@ -96,6 +155,8 @@ def main() -> None:
     show_failure("键类型为 str/int/bool", lambda: mphf.build([b"ok", "nope"]))
     show_failure("把单个 bytes 当集合", lambda: mphf.build(b"abc"))
     show_failure("lookup 键类型为 int", lambda: mphf.lookup(mphf.build([b"a"]), 123))
+    show_failure("内容与键数量不一致", lambda: mphf.build([b"a", b"b"], [b"x"]))
+    show_failure("内容不是 bytes", lambda: mphf.build([b"a"], ["str"]))
     print(f"  空表 lookup(b'\\x80') -> {mphf.lookup(mphf.build([]), b'\x80')}"
           "（非 ASCII 查询按非成员返回 -1，非异常）")
 

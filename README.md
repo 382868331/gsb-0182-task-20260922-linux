@@ -1,8 +1,10 @@
-# 压缩字典的最小访问完美哈希（MPHF）
+# 压缩字典的最小访问完美哈希（MPHF）+ 变长内容归档
 
 为离线静态索引工程提供的可复用模块：给定至多 **1000 条互不重复的 ASCII
 字节串**，确定性构造一个**最小完美哈希函数**（Minimal Perfect Hash Function），
-把每个键映射到紧凑序号 `0..n-1`，并通过槽位中保存的完整键做非成员终检。
+把每个键映射到紧凑序号 `0..n-1`，通过槽位中保存的完整键做非成员终检，
+并为每个键保存一份**变长二进制内容**（允许空内容）；整张表可序列化为
+自校验字节流/文件，重新加载后键的槽位与查询结果与保存前完全一致。
 
 纯 Python 标准库实现，核心算法（三哈希超图剥离 + 顶点赋值）自行实现，
 未使用任何第三方同类库。
@@ -18,7 +20,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（31 个用例）
+# 必要测试（58 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（当场真实计算，实测约 0.1 秒，远低于 8 秒预算；无 sleep、无预录）
@@ -36,9 +38,22 @@ mphf.lookup(table, b"beta")      # -> 1
 mphf.lookup(table, b"absent")    # -> mphf.NOT_FOUND (-1)
 table.lookup(b"alpha")           # 实例方法，等价
 table.get(b"absent", default=None)
+
+# 键 -> 变长内容（空内容与不存在严格区分）
+table = mphf.build([b"a", b"b"], [b"content-a", b""])
+mphf.fetch(table, b"a")          # -> b"content-a"
+mphf.fetch(table, b"b")          # -> b""   （空内容，真实命中）
+mphf.fetch(table, b"x")          # -> -1   （NOT_FOUND，不存在）
+table.get_content(b"x")          # -> None （默认哨兵，三态清晰）
+
+# 保存 / 重新加载（原子写文件；加载做边界与 SHA256 校验）
+blob = mphf.dumps(table)          # bytes
+t2 = mphf.loads(blob)             # 与 table 逐字段相等
+mphf.save(table, "index.mphf")
+t3 = mphf.load("index.mphf")
 ```
 
-### `build(keys) -> MPHFTable | CONSTRUCTION_FAILED`
+### `build(keys, contents=None) -> MPHFTable | CONSTRUCTION_FAILED`
 
 - `keys`：键的**可迭代对象**（list、tuple、生成器等；单个 `bytes` 不被当作
   集合，会抛 `TypeError`）。
@@ -48,6 +63,10 @@ table.get(b"absent", default=None)
   `NOT_FOUND`。
 - 返回不可变的 `MPHFTable`；全部 256 个 seed 都失败时返回哨兵
   `mphf.CONSTRUCTION_FAILED`（含义见“错误语义”）。
+- `contents`：可选、与 `keys` 等长等序的 bytes-like 可迭代对象，作为每个
+  键的变长内容；内容可以是任意字节（含 NUL、非 ASCII），允许空字节串
+  `b""`。省略时内容全部为 `b""`。长度不一致抛 `ValueError`，元素不是
+  bytes-like（含 `bool`）或传入单个 bytes 抛 `TypeError`。
 
 `MPHFTable` 字段（frozen dataclass）：
 
@@ -59,6 +78,7 @@ table.get(b"absent", default=None)
 | `values` | 每个顶点的赋值 `g`，`0..n-1` 的元组，长度 `m` |
 | `keys` | 槽位内容，`keys[i]` 即构造序号为 `i` 的原始键，长度 `n` |
 | `attempts` | 成功前尝试的 seed 个数（成功 seed 在内，≥1；空表为 0） |
+| `contents` | 与槽位平行的变长内容，`contents[i]` 即 `keys[i]` 的内容，长度 `n`；空表为 `()` |
 
 ### `lookup(table, key) -> int`
 
@@ -67,6 +87,42 @@ table.get(b"absent", default=None)
 - 命中判定以槽位保存的**完整键逐字节比较**为准：哈希只负责选出槽位，
   **绝不**以“哈希值存在/算出了某个槽位”判定命中。非成员即使哈希恰好
   落到已占用槽位也返回 `NOT_FOUND`。
+
+### `fetch(table, key) -> bytes | NOT_FOUND`
+
+- 成员：返回该键的内容 `bytes`，长度任意，允许为空字节串 `b""`；
+- 非成员：返回 `NOT_FOUND`（`-1`，一个 `int`，不可能与任何 `bytes`
+  混淆），因此**空内容与不存在是两种可区分的结果**；
+- 另有 `table.get_content(key, default=None)`：命中返回内容，非成员返回
+  `default`（默认 `None`），有内容/空内容/不存在三态清晰可分。
+
+### `dumps/loads/save/load`：归档与重新加载
+
+`dumps(table) -> bytes` 把整张表序列化为自校验字节流；`loads(data)` 重建，
+结果与原表逐字段相等（frozen dataclass 相等），所有键的槽位与
+`lookup/fetch` 结果保存前后一致。`save(table, path)` / `load(path)` 是文件
+接口：`save` 先写同目录唯一临时文件、`fsync` 后原子 `os.replace`，任何
+失败都不留半成品或临时文件。
+
+归档为**公开二进制格式**（多字节整数均为无符号大端）：
+
+```
+magic(8)=b"MPHF0001" | n uint32 | m uint32 | seed uint8 | attempts uint32
+| n 个 uint32 顶点赋值 g
+| n 条记录，每条 = klen uint32 | key 字节 | clen uint32 | content 字节
+| 对上述全部字节的 SHA256（32 字节）
+```
+
+加载时的校验顺序与保证：
+
+- 先查魔数与最小长度；末尾 32 字节是对前面全部字节的 SHA256，任何字节
+  翻转/截断都在解析前被拒绝（`ArchiveFormatError`）；
+- `n/m` 必须满足 `m = ceil(1.4n)`、`n ≤ 1000`；每个 `g` 必须 `< n`；
+- 每条记录的 `klen/clen` **先与剩余字节数比较再切片**：伪造的巨大长度或
+  错位长度（即使重算了合法校验和）只会产生 `ArchiveFormatError`，
+  **绝不越界读取，也读不到相邻记录或其他键的内容**；
+- 键必须为 ASCII、槽位间不得重复；记录之后不得有多余字节；
+- 最后重新独立验证全部成员槽位仍是 `0..n-1` 的双射，才返回表对象。
 
 ### 哈希线格式（公开契约）
 
@@ -112,6 +168,11 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 | 256 个 seed 全部失败 | **返回** `CONSTRUCTION_FAILED`（不抛异常） |
 | 对 `CONSTRUCTION_FAILED` 调用 `lookup` | `ValueError` |
 | 对非 `MPHFTable` 对象 `lookup` | `TypeError` |
+| `contents` 与 `keys` 长度不一致 | `ValueError` |
+| `contents` 元素不是 bytes-like（含 `bool`），或把单个 bytes 当内容集合 | `TypeError` |
+| 归档截断/魔数错误/校验和不匹配/字段越界/长度越界/记录错位 | `mphf.ArchiveFormatError`（`ValueError` 子类） |
+| `loads` 输入不是 bytes-like，或 `dumps` 的不是 `MPHFTable` | `TypeError` |
+| `load` 指向不存在的文件 | 标准 `FileNotFoundError`（`OSError`） |
 
 **搜索预算耗尽 ≠ 证明无解**：`CONSTRUCTION_FAILED` 只表示“seed 0..255
 在本算法（固定 `m=1.4n`、三哈希、SHA256 线格式）下均未成功”，是**预算
@@ -133,6 +194,10 @@ h_t(key) = int(SHA256( seed_be4 ‖ tag ‖ key ), big-endian) mod m
 - 仅实现本题契约的有限数学子集：固定 3 哈希、固定负载系数 1.4、固定
   SHA256 线格式；**不宣称**与任何行业 MPHF/PHF 标准或互操作格式兼容。
 - 静态结构：不支持构造后增删键；变更集合需重新 `build`。
+- 归档为本题自定义的有限格式（魔数 `MPHF0001`），**不宣称**与任何行业
+  字典/键值归档格式兼容；版本号保留在魔数中。
+- 内容只要求是字节串，本模块不解释其编码；键仍限定 ASCII（题面契约）。
+- 归档以 SHA256 检出偶然/恶意损坏，但不是加密，不提供机密性或信任锚。
 - 非成员判定需要完整键存储（每键一份），属于刻意的设计取舍，不做只存
   指纹的近似模式（那会引入误报率口径）。
 - `CONSTRUCTION_FAILED` 时不自动扩大顶点表、不更换哈希族；严格遵守
@@ -149,13 +214,18 @@ build→lookup 的往返一致仅作为补充断言。覆盖：n=1..60 与多个
 双射、n=1000 边界、空表、真实 seed-0 不可剥离集合 `{a,b,i}`（seed=2
 重试成功）、预算压为 1 时实际触发 `construction_failed`、非成员哈希碰撞
 拒绝、非 ASCII、重复键、类型/上限错误、确定性复现、128 个单字节 ASCII
-键全集。
+键全集。`tests/test_archive.py` 覆盖：变长内容与“有内容/空内容/不存在”
+三态、n=1/3/20/1000 的内存与文件往返一致性（重载后槽位与内容逐字段相等）、
+非成员重载后仍 `NOT_FOUND`、截断/魔数/逐字节翻转的校验和拒绝，以及
+**重算合法校验和后**伪造巨大 `klen/clen`、长度错位、`n/m` 不一致、
+`g` 越界、尾随字节、非 ASCII 键等边界——全部只能得到 `ArchiveFormatError`。
 
 ## 仓库布局
 
 ```
-mphf/__init__.py   # 核心库：build / lookup / MPHFTable / 错误与哨兵
-tests/test_mphf.py # 必要测试（独立参考期望值）
-demo.py            # 固定输入演示：正常索引 + 重试 + 拒绝/异常边界
+mphf/__init__.py     # build/lookup/fetch/dumps/loads/save/load 等
+tests/test_mphf.py   # 哈希/构造测试（独立参考期望值）
+tests/test_archive.py# 内容、往返与归档损坏/越界测试
+demo.py              # 固定输入演示：索引+内容+重试+存取重载+拒绝边界
 requirements.txt   # 无第三方依赖（说明性注释）
 ```
